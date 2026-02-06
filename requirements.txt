@@ -2,4 +2,5 @@ requests
 beautifulsoup4
 pandas
 openpyxl
-streamlit
+streamlit>=1.24.0
+altair==4.2.2
