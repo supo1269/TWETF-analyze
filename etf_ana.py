@@ -46,6 +46,7 @@ def get_google_sheet_data(client):
         return pd.DataFrame(columns=["帳號", "代號", "成交均價", "股數"])
 
 def save_to_google_sheet(client, username, code, cost, qty):
+    """單筆新增用"""
     try:
         sheet = client.open("ETF_Database").worksheet("holdings")
         sheet.append_row([username, code, cost, qty])
@@ -54,35 +55,50 @@ def save_to_google_sheet(client, username, code, cost, qty):
         st.error(f"寫入失敗: {e}")
         return False
 
-def delete_from_google_sheet(client, username, code):
+def update_google_sheet_batch(client, username, new_df):
+    """
+    ★ 批次更新功能 ★
+    直接把編輯好的 DataFrame 寫回 Google Sheets
+    """
     try:
         sheet = client.open("ETF_Database").worksheet("holdings")
-        data = sheet.get_all_records()
-        df = pd.DataFrame(data)
         
+        # 1. 讀取所有資料 (因為試算表裡可能有別人的資料，不能全刪)
+        all_data = sheet.get_all_records()
+        all_df = pd.DataFrame(all_data)
+        
+        # 2. 如果試算表是空的，直接寫入
+        if all_df.empty:
+            final_df = new_df
+        else:
+            # 3. 保留「不是」當前使用者的資料
+            other_users_df = all_df[all_df['帳號'].astype(str) != str(username)]
+            
+            # 4. 把當前使用者的新資料 (new_df) 加上去
+            # new_df 只有代號、成本、股數，我們要補上 '帳號'
+            user_data_to_save = new_df.copy()
+            user_data_to_save['帳號'] = username
+            
+            # 5. 合併
+            final_df = pd.concat([other_users_df, user_data_to_save], ignore_index=True)
+        
+        # 6. 整理欄位順序 (確保符合 Google Sheets 格式)
+        # 確保代號是字串 (雖然寫入時 gspread 會處理，但保險起見)
+        final_df['代號'] = final_df['代號'].astype(str).apply(normalize_code)
+        
+        # 只取需要的欄位
+        final_df = final_df[['帳號', '代號', '成交均價', '股數']]
+        
+        # 7. 寫回 Google Sheets (清除舊的 -> 寫入新的)
         sheet.clear()
-        sheet.append_row(["帳號", "代號", "成交均價", "股數"])
+        # 寫入標題
+        sheet.append_row(['帳號', '代號', '成交均價', '股數'])
+        # 寫入內容 (將 DataFrame 轉為 list of lists)
+        sheet.append_rows(final_df.values.tolist())
         
-        keep_rows = []
-        target_code = normalize_code(code)
-        deleted = False
-        
-        for i, row in df.iterrows():
-            row_code = normalize_code(row['代號'])
-            
-            if str(row['帳號']) == str(username) and row_code == target_code and not deleted:
-                deleted = True
-                continue
-            
-            row_data = row.tolist()
-            row_data[1] = row_code 
-            keep_rows.append(row_data)
-            
-        if keep_rows:
-            sheet.append_rows(keep_rows)
         return True
     except Exception as e:
-        st.error(f"刪除失敗: {e}")
+        st.error(f"更新失敗: {e}")
         return False
 
 client = init_connection()
@@ -91,7 +107,7 @@ headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 }
 
-# --- 樣式與爬蟲功能 ---
+# --- 樣式設定 ---
 def style_pl_color(val):
     if isinstance(val, (int, float)):
         color = '#d63031' if val > 0 else '#00b894' if val < 0 else 'black'
@@ -103,6 +119,7 @@ def style_top3_rows(row):
         return ['background-color: #ffe6e6'] * len(row)
     return [''] * len(row)
 
+# --- 爬蟲核心 ---
 def get_etf_return(stock_code):
     url = f"https://histock.tw/stock/{stock_code}"
     try:
@@ -232,16 +249,6 @@ def check_password():
         return True
     return False
 
-# --- 輔助函式：產生帶顏色的 HTML 字串 ---
-def color_html(val, is_percent=False):
-    """把數字轉成紅色(正)或綠色(負)的 HTML"""
-    if val > 0: color = "#d63031" # 紅
-    elif val < 0: color = "#00b894" # 綠
-    else: color = "black"
-    
-    fmt_val = f"{val:,.2f}%" if is_percent else f"{val:,.0f}"
-    return f"<span style='color:{color}; font-weight:bold'>{fmt_val}</span>"
-
 # --- 主程式 ---
 
 is_logged_in = check_password()
@@ -274,10 +281,9 @@ if not df_final.empty:
         if is_logged_in and client:
             st.subheader(f"{current_user} 的持股管理")
             
-            # --- 新增持股區 ---
+            # --- 新增持股區 (維持不變) ---
             with st.expander("➕ 新增持股", expanded=False):
                 c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-                
                 etf_options = []
                 for idx, row in df_final.iterrows():
                     code = row.get('代號', '')
@@ -292,12 +298,14 @@ if not df_final.empty:
                     if selected_etf and new_qty > 0:
                         code_to_save = selected_etf.split(" ")[0]
                         save_to_google_sheet(client, current_user, code_to_save, new_cost, new_qty)
-                        st.success(f"已儲存 {code_to_save}！")
+                        st.success(f"已新增 {code_to_save}！")
                         time.sleep(1)
                         st.rerun()
                     else: st.warning("請選擇 ETF 並輸入股數")
 
-            # --- 顯示持股列表 (自製表格版) ---
+            st.divider()
+
+            # --- ★★★ 可編輯表格區 ★★★ ---
             my_df = get_google_sheet_data(client)
             
             if not my_df.empty:
@@ -310,58 +318,83 @@ if not df_final.empty:
                     merged_df['現價'] = pd.to_numeric(merged_df['現價'], errors='coerce').fillna(0)
                     merged_df['成交均價'] = pd.to_numeric(merged_df['成交均價'], errors='coerce').fillna(0)
                     merged_df['股數'] = pd.to_numeric(merged_df['股數'], errors='coerce').fillna(0)
-                    merged_df['名稱'] = merged_df['名稱'].fillna("未知(代號錯誤)")
                     
                     merged_df['現值'] = merged_df['現價'] * merged_df['股數']
                     merged_df['總成本'] = merged_df['成交均價'] * merged_df['股數']
                     merged_df['預估損益'] = merged_df['現值'] - merged_df['總成本']
-                    merged_df['報酬率'] = 0.0
+                    merged_df['報酬率%'] = 0.0 # 改名方便顯示
                     mask = merged_df['總成本'] > 0
-                    merged_df.loc[mask, '報酬率'] = (merged_df.loc[mask, '預估損益'] / merged_df.loc[mask, '總成本']) * 100
+                    merged_df.loc[mask, '報酬率%'] = (merged_df.loc[mask, '預估損益'] / merged_df.loc[mask, '總成本']) * 100
                     
-                    st.write("### 持股明細")
+                    # --- 準備編輯的 DataFrame ---
+                    # 1. 增加「刪除」勾選欄位 (預設 False)
+                    merged_df['刪除'] = False
                     
-                    # ★★★ 這裡開始：手刻表格 Header ★★★
-                    # 我們用 st.columns 來模擬表格的欄位
-                    # 比例：代號(1.2) 名稱(2.5) 股數(1.2) 均價(1.5) 現價(1.5) 現值(1.5) 損益(1.5) 報酬(1.5) 操作(1)
-                    cols_ratio = [1.2, 2.5, 1.2, 1.5, 1.5, 1.5, 1.5, 1.5, 1]
-                    h1, h2, h3, h4, h5, h6, h7, h8, h9 = st.columns(cols_ratio)
+                    # 2. 選出要顯示和編輯的欄位
+                    # 注意：我們把「刪除」放最前面
+                    edit_cols = ['刪除', '代號', '名稱', '股數', '成交均價', '現價', '現值', '預估損益', '報酬率%']
+                    edit_df = merged_df[edit_cols].copy()
                     
-                    h1.markdown("**代號**")
-                    h2.markdown("**名稱**")
-                    h3.markdown("**股數**")
-                    h4.markdown("**均價**")
-                    h5.markdown("**現價**")
-                    h6.markdown("**現值**")
-                    h7.markdown("**損益**")
-                    h8.markdown("**報酬**")
-                    h9.markdown("**操作**") # 這就是刪除鍵的標題
+                    st.write("### 💼 持股明細 (可直接編輯)")
+                    st.info("💡 提示：點擊標題可排序 | 點擊數字可直接修改成本與股數 | 勾選左側可刪除 | 修改完畢請按下方「儲存變更」")
                     
-                    st.divider() # 畫一條分隔線
+                    # 3. 使用 st.data_editor
+                    edited_df = st.data_editor(
+                        edit_df,
+                        column_config={
+                            "刪除": st.column_config.CheckboxColumn(
+                                "刪除?",
+                                help="勾選後按儲存即可刪除此筆資料",
+                                default=False,
+                            ),
+                            "代號": st.column_config.TextColumn(
+                                "代號", disabled=True # 代號不能改，改了會亂掉
+                            ),
+                            "名稱": st.column_config.TextColumn(
+                                "名稱", disabled=True
+                            ),
+                            "股數": st.column_config.NumberColumn(
+                                "股數", min_value=1, step=1, format="%d"
+                            ),
+                            "成交均價": st.column_config.NumberColumn(
+                                "成交均價", min_value=0.0, format="%.2f"
+                            ),
+                            "現價": st.column_config.NumberColumn(
+                                "現價", disabled=True, format="%.2f"
+                            ),
+                            "現值": st.column_config.NumberColumn(
+                                "現值", disabled=True, format="$%d"
+                            ),
+                            "預估損益": st.column_config.NumberColumn(
+                                "預估損益", disabled=True, format="$%d"
+                            ),
+                            "報酬率%": st.column_config.NumberColumn(
+                                "報酬率%", disabled=True, format="%.2f%%"
+                            ),
+                        },
+                        disabled=["代號", "名稱", "現價", "現值", "預估損益", "報酬率%"], # 再次確保這些不能改
+                        hide_index=True,
+                        use_container_width=True
+                    )
                     
-                    # ★★★ 這裡開始：手刻表格 Rows ★★★
-                    for idx, row in merged_df.iterrows():
-                        c1, c2, c3, c4, c5, c6, c7, c8, c9 = st.columns(cols_ratio)
+                    # 4. 儲存按鈕邏輯
+                    if st.button("💾 儲存變更", type="primary"):
+                        # 邏輯：
+                        # 1. 找出沒有被勾選刪除的資料
+                        # 2. 取出 '代號', '成交均價', '股數' 這三個我們要存的欄位
                         
-                        c1.write(f"{row['代號']}")
-                        c2.write(f"{row['名稱']}")
-                        c3.write(f"{int(row['股數']):,}")
-                        c4.write(f"{row['成交均價']:.2f}")
-                        c5.write(f"{row['現價']:.2f}")
-                        c6.write(f"{row['現值']:,.0f}")
+                        rows_to_save = edited_df[edited_df['刪除'] == False]
                         
-                        # 損益和報酬率用顏色顯示
-                        c7.markdown(color_html(row['預估損益']), unsafe_allow_html=True)
-                        c8.markdown(color_html(row['報酬率'], is_percent=True), unsafe_allow_html=True)
+                        # 準備寫回資料庫的 DataFrame
+                        df_to_save = rows_to_save[['代號', '成交均價', '股數']].copy()
                         
-                        # ★★★ 關鍵：刪除按鈕直接放在這一列的最後面 ★★★
-                        if c9.button("刪除", key=f"btn_del_{row['代號']}_{idx}"):
-                            delete_from_google_sheet(client, current_user, row['代號'])
+                        if update_google_sheet_batch(client, current_user, df_to_save):
+                            st.success("✅ 資料已更新！(修改與刪除已同步)")
+                            time.sleep(1)
                             st.rerun()
-                        
-                        # 每行加個底線，比較像表格
-                        st.markdown("<hr style='margin: 5px 0; border-top: 1px solid #eee;'>", unsafe_allow_html=True)
-                        
+                        else:
+                            st.error("存檔失敗，請檢查網路或權限。")
+
                 else: st.info("尚無持股資料。")
             else: st.info("讀取資料庫中...")
         elif not is_logged_in: st.warning("🔒 請先登入")
