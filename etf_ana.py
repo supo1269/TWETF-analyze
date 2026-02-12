@@ -94,4 +94,66 @@ def fetch_all_etf_data():
             # 過濾邏輯
             if len(href_code) < 4 or len(href_code) > 6 or not href_code[0].isdigit(): continue
             if href_code.upper().endswith(('L', 'R')): continue # 排除槓桿/反向
-            if any(
+            if any(kw in row_text for kw in china_keywords): continue # 排除中國市場
+            
+            if href_code not in etf_codes: 
+                etf_codes.append(href_code)
+
+        # 2. 開始分析
+        results = []
+        total = len(etf_codes)
+        
+        # 建立進度條容器
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        for i, code in enumerate(etf_codes):
+            # 更新進度文字
+            status_text.text(f"🚀 正在分析 [{i+1}/{total}]: {code} ...")
+            progress_bar.progress((i + 1) / total)
+            
+            data = get_etf_return(code)
+            if data:
+                results.append(data)
+            time.sleep(0.05) #稍微加快速度
+        
+        # 清除進度條
+        status_text.empty()
+        progress_bar.empty()
+        
+        return pd.DataFrame(results)
+
+    except Exception as e:
+        st.error(f"資料抓取失敗: {e}")
+        return pd.DataFrame()
+
+# --- 網頁執行流程 ---
+
+# 呼叫主函式 (如果有快取就讀快取，沒有就重跑)
+df_final = fetch_all_etf_data()
+
+if not df_final.empty:
+    # 排序：綜合平均由高到低
+    df_sorted = df_final.sort_values(by='綜合平均%', ascending=False).reset_index(drop=True)
+    
+    # 顯示成功訊息 (注意這裡的括號要小心)
+    st.success(f"✅ 資料載入成功！共分析 {len(df_sorted)} 檔 ETF。")
+    
+    # 顯示排行榜表格
+    st.dataframe(df_sorted, use_container_width=True)
+    
+    # 準備 Excel 下載
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_sorted.to_excel(writer, index=False)
+    
+    # 下載按鈕 (這就是最容易出錯的地方，請確保複製完整)
+    st.download_button(
+        label="📥 下載 Excel 分析報表",
+        data=output.getvalue(),
+        file_name="ETF_Analysis_Report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+else:
+    st.warning("目前沒有抓到資料，請點擊右上角的「更新」按鈕重試。")
