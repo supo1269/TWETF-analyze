@@ -26,22 +26,12 @@ def init_connection():
         return None
 
 def normalize_code(code):
-    """
-    標準化代號修正版：
-    台灣 ETF 慣例通常是 00 開頭。
-    如果使用者輸入 50 -> 補成 0050
-    如果使用者輸入 735 -> 補成 00735
-    """
+    """標準化代號"""
     code_str = str(code).strip().replace("'", "")
-    
-    # 如果是純數字，且不是 0 開頭，強制補兩個 0
     if code_str.isdigit() and not code_str.startswith("0"):
         return "00" + code_str
-    
-    # 或是如果是 4 碼以下但有少 0，用舊邏輯保護
     if code_str.isdigit() and len(code_str) < 4:
         return code_str.zfill(4)
-        
     return code_str
 
 def get_google_sheet_data(client):
@@ -49,10 +39,8 @@ def get_google_sheet_data(client):
         sheet = client.open("ETF_Database").worksheet("holdings")
         data = sheet.get_all_records()
         df = pd.DataFrame(data)
-        
         if not df.empty and '代號' in df.columns:
             df['代號'] = df['代號'].apply(normalize_code)
-            
         return df
     except Exception as e:
         return pd.DataFrame(columns=["帳號", "代號", "成交均價", "股數"])
@@ -60,9 +48,7 @@ def get_google_sheet_data(client):
 def save_to_google_sheet(client, username, code, cost, qty):
     try:
         sheet = client.open("ETF_Database").worksheet("holdings")
-        fmt_code = normalize_code(code)
-        # 這裡不加單引號，讓 Sheet 自己判斷，反正讀出來我們會 normalize
-        sheet.append_row([username, fmt_code, cost, qty])
+        sheet.append_row([username, code, cost, qty])
         return True
     except Exception as e:
         st.error(f"寫入失敗: {e}")
@@ -132,7 +118,6 @@ def get_etf_return(stock_code):
         name_tag = soup.find('h3') 
         if name_tag: data['名稱'] = name_tag.text.split('(')[0].strip()
 
-        # 抓取市場別
         candidates = soup.find_all(['li', 'td'])
         for tag in candidates:
             text = tag.text.strip()
@@ -143,7 +128,6 @@ def get_etf_return(stock_code):
             if soup.find(string="上市"): data['市場別'] = '上市'
             elif soup.find(string="上櫃"): data['市場別'] = '上櫃'
 
-        # 抓取現價
         price_span = soup.find('span', id='Price1_lbTPrice')
         if price_span:
             try:
@@ -203,7 +187,6 @@ def fetch_all_etf_data():
             href_code = link['href'].split('/')[-1]
             row_text = row.text.strip()
             
-            # 這裡只要是數字就抓，透過後續標準化處理
             if not href_code[0].isdigit(): continue
             if href_code.upper().endswith(('L', 'R')): continue 
             if any(kw in row_text for kw in china_keywords): continue 
@@ -268,15 +251,11 @@ if not df_final.empty:
         with col2:
             if st.button('🔄 更新'): st.cache_data.clear(); st.rerun()
         
-        # ★ 修正點：把 '市場別' 加回來了
         market_cols = ['代號', '名稱', '市場別', '現價', '一季%', '半年%', '一年%', '綜合平均%']
-        
-        # 確保欄位存在才顯示
         existing_cols = [c for c in market_cols if c in df_final.columns]
         df_show = df_final[existing_cols].sort_values(by='綜合平均%', ascending=False).reset_index(drop=True)
         df_show.index += 1
         
-        # 套用樣式
         styler = df_show.style.map(style_pl_color, subset=['一季%', '半年%', '一年%', '綜合平均%']) \
                               .apply(style_top3_rows, axis=1) \
                               .format("{:.2f}", subset=['現價', '一季%', '半年%', '一年%', '綜合平均%'])
@@ -288,13 +267,29 @@ if not df_final.empty:
             
             with st.expander("➕ 新增持股"):
                 c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-                new_code = c1.text_input("代號 (如 0050, 00735)")
+                
+                # 下拉式選單製作
+                etf_options = []
+                for idx, row in df_final.iterrows():
+                    code = row.get('代號', '')
+                    name = row.get('名稱', '')
+                    if code:
+                        etf_options.append(f"{code} {name}")
+                
+                selected_etf = c1.selectbox("選擇或搜尋 ETF", options=etf_options, index=None, placeholder="請輸入代號或名稱...")
+                
                 new_cost = c2.number_input("成交均價", min_value=0.0)
                 new_qty = c3.number_input("股數", min_value=1, step=1)
+                
                 if c4.button("儲存"):
-                    if new_code and new_qty > 0:
-                        save_to_google_sheet(client, current_user, new_code, new_cost, new_qty)
-                        st.success("已儲存！"); time.sleep(1); st.rerun()
+                    if selected_etf and new_qty > 0:
+                        code_to_save = selected_etf.split(" ")[0]
+                        save_to_google_sheet(client, current_user, code_to_save, new_cost, new_qty)
+                        st.success(f"已儲存 {code_to_save}！")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.warning("請選擇 ETF 並輸入股數")
 
             my_df = get_google_sheet_data(client)
             
@@ -312,24 +307,32 @@ if not df_final.empty:
                     merged_df['股數'] = pd.to_numeric(merged_df['股數'], errors='coerce').fillna(0)
                     merged_df['名稱'] = merged_df['名稱'].fillna("未知(代號錯誤)")
                     
-                    merged_df['市值'] = merged_df['現價'] * merged_df['股數']
-                    merged_df['總成本'] = merged_df['成交均價'] * merged_df['股數']
-                    merged_df['預估損益'] = merged_df['市值'] - merged_df['總成本']
+                    # ★★★ 計算區域 ★★★
+                    # 1. 計算現值 (市值)
+                    merged_df['現值'] = merged_df['現價'] * merged_df['股數']
                     
+                    # 2. 計算總成本
+                    merged_df['總成本'] = merged_df['成交均價'] * merged_df['股數']
+                    
+                    # 3. 計算損益與報酬率
+                    merged_df['預估損益'] = merged_df['現值'] - merged_df['總成本']
+                    merged_df['報酬率'] = 0.0
                     mask = merged_df['總成本'] > 0
                     merged_df.loc[mask, '報酬率'] = (merged_df.loc[mask, '預估損益'] / merged_df.loc[mask, '總成本']) * 100
                     
-                    # 這裡如果想要也顯示市場別，可以加進去
-                    display_cols = ['代號', '名稱', '市場別', '股數', '成交均價', '現價', '預估損益', '報酬率']
-                    # 確保市場別存在
+                    # ★★★ 設定顯示順序，加入「現值」 ★★★
+                    display_cols = ['代號', '名稱', '市場別', '股數', '成交均價', '現價', '現值', '預估損益', '報酬率']
                     valid_cols = [c for c in display_cols if c in merged_df.columns]
                     final_view = merged_df[valid_cols].copy()
                     
                     st.write("### 持股明細")
+                    
+                    # ★★★ 設定數字格式：現值、損益加逗號 (1,000) ★★★
                     styler = final_view.style.format({
                         '成交均價': "{:.2f}",
                         '現價': "{:.2f}",
-                        '預估損益': "{:.0f}", 
+                        '現值': "{:,.0f}",    # 例如：15,000
+                        '預估損益': "{:,.0f}", # 例如：-2,300
                         '報酬率': "{:.2f}%"
                     }).map(style_pl_color, subset=['預估損益', '報酬率'])
                     
