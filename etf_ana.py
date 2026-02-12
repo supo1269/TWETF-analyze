@@ -5,27 +5,36 @@ import pandas as pd
 import time
 import random
 import io
+import os
 
 # --- 網頁設定 ---
-st.set_page_config(page_title="台股 ETF 績效自動分析", layout="wide")
+st.set_page_config(page_title="台股 ETF 資產管家", layout="wide")
 
-# --- 標題與更新按鈕區塊 ---
-col1, col2 = st.columns([8, 1])
+# --- 模擬資料庫路徑 ---
+CSV_FILE = "holdings.csv"
 
-with col1:
-    st.title("📊 台股 ETF 績效分析排行榜")
-    st.caption("資料來源：HiStock | 自動過濾：槓桿、反向、中國/港股市場 | 樣式：台股紅漲綠跌")
+# --- 檢查帳本是否存在，不存在就創一個 ---
+if not os.path.exists(CSV_FILE):
+    df_empty = pd.DataFrame(columns=["代號", "成本", "股數"])
+    df_empty.to_csv(CSV_FILE, index=False)
 
-with col2:
-    if st.button('🔄 更新'):
-        st.cache_data.clear()
-        st.rerun()
+# --- 樣式設定 ---
+def style_text_color(val):
+    if isinstance(val, (int, float)):
+        color = '#d63031' if val > 0 else '#00b894' if val < 0 else 'black'
+        return f'color: {color}; font-weight: bold;'
+    return ''
 
+def style_top3_rows(row):
+    if row.name in [1, 2, 3]:
+        return ['background-color: #ffe6e6'] * len(row)
+    return [''] * len(row)
+
+# --- 爬蟲功能 (維持不變) ---
 headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 }
 
-# --- 功能：分析單一檔 ETF ---
 def get_etf_return(stock_code):
     url = f"https://histock.tw/stock/{stock_code}"
     try:
@@ -37,24 +46,19 @@ def get_etf_return(stock_code):
             '一季%': None, '半年%': None, '一年%': None, '綜合平均%': None
         }
 
-        # 抓取名稱
         name_tag = soup.find('h3') 
         if name_tag: data['名稱'] = name_tag.text.split('(')[0].strip()
 
-        # 抓取市場別
         candidates = soup.find_all(['li', 'td'])
         for tag in candidates:
             text = tag.text.strip()
             if '市場' in text:
-                if '上市' in text:
-                    data['市場別'] = '上市'; break
-                elif '上櫃' in text:
-                    data['市場別'] = '上櫃'; break
+                if '上市' in text: data['市場別'] = '上市'; break
+                elif '上櫃' in text: data['市場別'] = '上櫃'; break
         if data['市場別'] == "未知":
             if soup.find(string="上市"): data['市場別'] = '上市'
             elif soup.find(string="上櫃"): data['市場別'] = '上櫃'
 
-        # 抓取績效
         table = soup.find('table', class_='tbPerform')
         if not table: return None
         
@@ -85,7 +89,6 @@ def get_etf_return(stock_code):
     except: pass
     return None
 
-# --- 核心功能：抓取與分析 ---
 @st.cache_data(ttl=3600, show_spinner="正在更新 ETF 資料中，請稍候...")
 def fetch_all_etf_data():
     url = "https://histock.tw/stock/etf.aspx"
@@ -128,62 +131,152 @@ def fetch_all_etf_data():
         st.error(f"資料抓取失敗: {e}")
         return pd.DataFrame()
 
-# --- ★ 美化樣式函式區 ★ ---
+# --- ★ 登入系統邏輯 ★ ---
+def check_password():
+    """簡單的密碼驗證"""
+    def password_entered():
+        if st.session_state["username"] == "admin" and st.session_state["password"] == "1234":
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # 安全起見，刪除密碼
+        else:
+            st.session_state["password_correct"] = False
 
-# 1. 文字顏色：正紅、負綠、零黑
-def style_text_color(val):
-    if isinstance(val, (int, float)):
-        color = '#d63031' if val > 0 else '#00b894' if val < 0 else 'black'
-        return f'color: {color}; font-weight: bold;'
-    return ''
+    if "password_correct" not in st.session_state:
+        # 顯示登入框
+        st.sidebar.header("🔒 會員登入")
+        st.sidebar.text_input("帳號", key="username")
+        st.sidebar.text_input("密碼", type="password", key="password")
+        st.sidebar.button("登入", on_click=password_entered)
+        return False
+    elif not st.session_state["password_correct"]:
+        # 登入失敗
+        st.sidebar.header("🔒 會員登入")
+        st.sidebar.text_input("帳號", key="username")
+        st.sidebar.text_input("密碼", type="password", key="password")
+        st.sidebar.button("登入", on_click=password_entered)
+        st.sidebar.error("帳號或密碼錯誤")
+        return False
+    else:
+        # 登入成功
+        st.sidebar.success("✅ 已登入：admin")
+        if st.sidebar.button("登出"):
+            st.session_state["password_correct"] = False
+            st.rerun()
+        return True
 
-# 2. 背景顏色：前三名顯示淡紅色
-def style_top3_rows(row):
-    # 檢查該列的索引 (Index) 是否在 1, 2, 3 裡面
-    if row.name in [1, 2, 3]:
-        return ['background-color: #ffe6e6'] * len(row)
-    return [''] * len(row)
+# --- 存檔功能 ---
+def save_holding(code, cost, qty):
+    try:
+        df = pd.read_csv(CSV_FILE, dtype=str) # 讀取舊資料
+        new_row = pd.DataFrame({"代號": [code], "成本": [cost], "股數": [qty]})
+        df = pd.concat([df, new_row], ignore_index=True)
+        df.to_csv(CSV_FILE, index=False)
+        return True
+    except Exception as e:
+        st.error(f"存檔失敗: {e}")
+        return False
 
-# --- 網頁執行流程 ---
+def delete_holding(index):
+    try:
+        df = pd.read_csv(CSV_FILE)
+        df = df.drop(index)
+        df.to_csv(CSV_FILE, index=False)
+        return True
+    except: return False
 
+# --- 主程式區塊 ---
+
+is_logged_in = check_password()
+
+st.title("💰 台股 ETF 資產管家")
+
+# 準備資料 (如果有登入就顯示，沒登入也顯示，但功能不同)
 df_final = fetch_all_etf_data()
 
 if not df_final.empty:
-    cols = ['代號', '名稱', '市場別', '一季%', '半年%', '一年%', '綜合平均%']
-    existing_cols = [c for c in cols if c in df_final.columns]
     
-    # 排序並重置索引
-    df_sorted = df_final[existing_cols].sort_values(by='綜合平均%', ascending=False).reset_index(drop=True)
+    # 建立分頁
+    tab1, tab2 = st.tabs(["📊 市場排行榜", "💼 我的持股"])
     
-    # ★ 重點 1：將索引從 0 開始改成從 1 開始
-    df_sorted.index = df_sorted.index + 1
-    
-    st.success(f"✅ 資料載入成功！共分析 {len(df_sorted)} 檔 ETF。")
-    
-    # ★ 重點 2 & 3：套用樣式
-    # 針對數值欄位套用「紅漲綠跌」
-    styler = df_sorted.style.map(style_text_color, subset=['一季%', '半年%', '一年%', '綜合平均%'])
-    
-    # 針對整列套用「前三名背景色」
-    styler = styler.apply(style_top3_rows, axis=1)
-    
-    # 設定數字格式 (保留兩位小數)
-    styler = styler.format("{:.2f}", subset=['一季%', '半年%', '一年%', '綜合平均%'])
-    
-    # 顯示美化後的表格
-    st.dataframe(styler, use_container_width=True, height=600)
-    
-    # 下載按鈕 (維持不變，下載乾淨的 Excel)
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_sorted.to_excel(writer, index=True, index_label="排名") # 下載時包含排名
-    
-    st.download_button(
-        label="📥 下載 Excel 分析報表",
-        data=output.getvalue(),
-        file_name="ETF_Analysis_Report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    # --- 分頁 1: 市場排行榜 ---
+    with tab1:
+        st.subheader("全台 ETF 績效排行")
+        col1, col2 = st.columns([8, 1])
+        with col2:
+            if st.button('🔄 更新行情'):
+                st.cache_data.clear()
+                st.rerun()
+        
+        cols = ['代號', '名稱', '市場別', '一季%', '半年%', '一年%', '綜合平均%']
+        existing_cols = [c for c in cols if c in df_final.columns]
+        df_sorted = df_final[existing_cols].sort_values(by='綜合平均%', ascending=False).reset_index(drop=True)
+        df_sorted.index = df_sorted.index + 1
+        
+        styler = df_sorted.style.map(style_text_color, subset=['一季%', '半年%', '一年%', '綜合平均%']) \
+                                .apply(style_top3_rows, axis=1) \
+                                .format("{:.2f}", subset=['一季%', '半年%', '一年%', '綜合平均%'])
+        
+        st.dataframe(styler, use_container_width=True, height=600)
+
+    # --- 分頁 2: 我的持股 ---
+    with tab2:
+        if is_logged_in:
+            st.subheader("我的持股管理")
+            
+            # 1. 新增持股區
+            with st.expander("➕ 新增持股"):
+                c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+                new_code = c1.text_input("代號 (如 0050)")
+                new_cost = c2.number_input("平均成本", min_value=0.0)
+                new_qty = c3.number_input("股數", min_value=1, step=1)
+                
+                if c4.button("儲存"):
+                    if new_code and new_qty > 0:
+                        if save_holding(new_code, new_cost, new_qty):
+                            st.success(f"已新增 {new_code}")
+                            time.sleep(1)
+                            st.rerun()
+                    else:
+                        st.warning("請輸入完整資料")
+
+            # 2. 讀取並顯示持股
+            if os.path.exists(CSV_FILE):
+                my_df = pd.read_csv(CSV_FILE, dtype={'代號': str})
+                
+                if not my_df.empty:
+                    # 合併行情資料
+                    # 這裡要做一點資料處理，把爬蟲抓到的行情併進來
+                    merged_df = pd.merge(my_df, df_final, on='代號', how='left')
+                    
+                    # 顯示持股表格 (可以刪除)
+                    st.write("目前持股明細：")
+                    
+                    # 為了讓刪除功能好做，我們用 data_editor (可編輯表格) 或是每一行加按鈕
+                    # 這裡示範簡單的列表 + 刪除按鈕
+                    for idx, row in merged_df.iterrows():
+                        with st.container():
+                            c1, c2, c3, c4, c5 = st.columns([1, 2, 2, 2, 1])
+                            c1.write(f"**{row['代號']}**")
+                            c2.write(f"{row['名稱']}")
+                            
+                            # 顯示報酬率顏色
+                            ret = row['綜合平均%']
+                            color = "red" if ret > 0 else "green" if ret < 0 else "black"
+                            c3.markdown(f"綜合績效: <span style='color:{color}'>{ret}%</span>", unsafe_allow_html=True)
+                            
+                            c4.write(f"持有: {row['股數']} 股 (成本 {row['成本']})")
+                            
+                            if c5.button("刪除", key=f"del_{idx}"):
+                                delete_holding(idx)
+                                st.rerun()
+                            st.divider()
+                            
+                else:
+                    st.info("目前還沒有持股，請上方新增。")
+            else:
+                st.info("資料庫初始化中...")
+        else:
+            st.warning("🔒 請先從左側登入，才能查看與管理持股。")
 
 else:
-    st.warning("目前沒有抓到資料，請點擊右上角的「更新」按鈕重試。")
+    st.warning("資料載入中，請稍候...")
