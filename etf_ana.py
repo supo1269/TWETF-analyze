@@ -222,7 +222,7 @@ def check_password():
         st.sidebar.text_input("帳號", key="username")
         st.sidebar.text_input("密碼", type="password", key="password")
         if st.sidebar.button("登入"):
-            if st.session_state["username"] == "admin" and st.session_state["password"] == "1234":
+            if st.session_state["username"] == "bobi" and st.session_state["password"] == "supo1269":
                 st.session_state["password_correct"] = True
                 st.session_state["current_user"] = "admin"
                 st.rerun()
