@@ -274,4 +274,77 @@ if not df_final.empty:
         # 確保欄位存在才顯示
         existing_cols = [c for c in market_cols if c in df_final.columns]
         df_show = df_final[existing_cols].sort_values(by='綜合平均%', ascending=False).reset_index(drop=True)
-        df_show.
+        df_show.index += 1
+        
+        # 套用樣式
+        styler = df_show.style.map(style_pl_color, subset=['一季%', '半年%', '一年%', '綜合平均%']) \
+                              .apply(style_top3_rows, axis=1) \
+                              .format("{:.2f}", subset=['現價', '一季%', '半年%', '一年%', '綜合平均%'])
+        st.dataframe(styler, use_container_width=True)
+
+    with tab2:
+        if is_logged_in and client:
+            st.subheader(f"{current_user} 的持股管理")
+            
+            with st.expander("➕ 新增持股"):
+                c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+                new_code = c1.text_input("代號 (如 0050, 00735)")
+                new_cost = c2.number_input("成交均價", min_value=0.0)
+                new_qty = c3.number_input("股數", min_value=1, step=1)
+                if c4.button("儲存"):
+                    if new_code and new_qty > 0:
+                        save_to_google_sheet(client, current_user, new_code, new_cost, new_qty)
+                        st.success("已儲存！"); time.sleep(1); st.rerun()
+
+            my_df = get_google_sheet_data(client)
+            
+            if not my_df.empty:
+                my_df['代號'] = my_df['代號'].apply(normalize_code)
+                df_final['代號'] = df_final['代號'].apply(normalize_code)
+
+                user_df = my_df[my_df['帳號'] == current_user].copy()
+                
+                if not user_df.empty:
+                    merged_df = pd.merge(user_df, df_final, on='代號', how='left')
+                    
+                    merged_df['現價'] = pd.to_numeric(merged_df['現價'], errors='coerce').fillna(0)
+                    merged_df['成交均價'] = pd.to_numeric(merged_df['成交均價'], errors='coerce').fillna(0)
+                    merged_df['股數'] = pd.to_numeric(merged_df['股數'], errors='coerce').fillna(0)
+                    merged_df['名稱'] = merged_df['名稱'].fillna("未知(代號錯誤)")
+                    
+                    merged_df['市值'] = merged_df['現價'] * merged_df['股數']
+                    merged_df['總成本'] = merged_df['成交均價'] * merged_df['股數']
+                    merged_df['預估損益'] = merged_df['市值'] - merged_df['總成本']
+                    
+                    mask = merged_df['總成本'] > 0
+                    merged_df.loc[mask, '報酬率'] = (merged_df.loc[mask, '預估損益'] / merged_df.loc[mask, '總成本']) * 100
+                    
+                    # 這裡如果想要也顯示市場別，可以加進去
+                    display_cols = ['代號', '名稱', '市場別', '股數', '成交均價', '現價', '預估損益', '報酬率']
+                    # 確保市場別存在
+                    valid_cols = [c for c in display_cols if c in merged_df.columns]
+                    final_view = merged_df[valid_cols].copy()
+                    
+                    st.write("### 持股明細")
+                    styler = final_view.style.format({
+                        '成交均價': "{:.2f}",
+                        '現價': "{:.2f}",
+                        '預估損益': "{:.0f}", 
+                        '報酬率': "{:.2f}%"
+                    }).map(style_pl_color, subset=['預估損益', '報酬率'])
+                    
+                    st.dataframe(styler, use_container_width=True)
+                    
+                    st.write("---")
+                    st.write("🗑️ 管理持股")
+                    for idx, row in user_df.iterrows():
+                        if st.button(f"刪除 {row['代號']}", key=f"del_{row['代號']}_{idx}"):
+                            delete_from_google_sheet(client, current_user, row['代號'])
+                            st.rerun()
+
+                else: st.info("尚無持股資料。")
+            else: st.info("讀取資料庫中...")
+        elif not is_logged_in: st.warning("🔒 請先登入")
+        else: st.error("連線錯誤")
+
+else: st.warning("資料載入中...")
