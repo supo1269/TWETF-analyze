@@ -201,7 +201,7 @@ def fetch_all_etf_data():
 # --- 登入系統邏輯 ---
 def check_password():
     def password_entered():
-        if st.session_state["username"] == "admin" and st.session_state["password"] == "1234":
+        if st.session_state["username"] == "bobi" and st.session_state["password"] == "supo1269":
             st.session_state["password_correct"] = True
             st.session_state["current_user"] = "admin" # 紀錄當前使用者
             del st.session_state["password"]
