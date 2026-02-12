@@ -26,13 +26,22 @@ def init_connection():
         return None
 
 def normalize_code(code):
-    """標準化代號：轉成字串，若是純數字則補滿4位"""
-    code_str = str(code).strip()
-    # 移除可能存在的單引號 (為了相容舊資料)
-    code_str = code_str.replace("'", "")
+    """
+    標準化代號修正版：
+    台灣 ETF 慣例通常是 00 開頭。
+    如果使用者輸入 50 -> 補成 0050
+    如果使用者輸入 735 -> 補成 00735
+    """
+    code_str = str(code).strip().replace("'", "")
     
+    # 如果是純數字，且不是 0 開頭，強制補兩個 0
+    if code_str.isdigit() and not code_str.startswith("0"):
+        return "00" + code_str
+    
+    # 或是如果是 4 碼以下但有少 0，用舊邏輯保護
     if code_str.isdigit() and len(code_str) < 4:
         return code_str.zfill(4)
+        
     return code_str
 
 def get_google_sheet_data(client):
@@ -42,7 +51,6 @@ def get_google_sheet_data(client):
         df = pd.DataFrame(data)
         
         if not df.empty and '代號' in df.columns:
-            # 讀取時，不管 Sheets 裡是 '0050 還是 50，通通標準化
             df['代號'] = df['代號'].apply(normalize_code)
             
         return df
@@ -52,8 +60,8 @@ def get_google_sheet_data(client):
 def save_to_google_sheet(client, username, code, cost, qty):
     try:
         sheet = client.open("ETF_Database").worksheet("holdings")
-        # ★ 修改點：不再強制加單引號，直接存入標準化後的代號
         fmt_code = normalize_code(code)
+        # 這裡不加單引號，讓 Sheet 自己判斷，反正讀出來我們會 normalize
         sheet.append_row([username, fmt_code, cost, qty])
         return True
     except Exception as e:
@@ -81,7 +89,6 @@ def delete_from_google_sheet(client, username, code):
                 continue
             
             row_data = row.tolist()
-            # ★ 修改點：寫回時也不加單引號
             row_data[1] = row_code 
             keep_rows.append(row_data)
             
@@ -105,6 +112,11 @@ def style_pl_color(val):
         return f'color: {color}; font-weight: bold;'
     return ''
 
+def style_top3_rows(row):
+    if row.name in [1, 2, 3]:
+        return ['background-color: #ffe6e6'] * len(row)
+    return [''] * len(row)
+
 # --- 爬蟲核心 ---
 def get_etf_return(stock_code):
     url = f"https://histock.tw/stock/{stock_code}"
@@ -113,12 +125,23 @@ def get_etf_return(stock_code):
         soup = BeautifulSoup(response.text, 'html.parser')
         
         data = {
-            '代號': stock_code, '名稱': "未知", '現價': 0.0,
+            '代號': stock_code, '名稱': "未知", '市場別': "未知", '現價': 0.0,
             '一季%': 0.0, '半年%': 0.0, '一年%': 0.0, '綜合平均%': 0.0
         }
 
         name_tag = soup.find('h3') 
         if name_tag: data['名稱'] = name_tag.text.split('(')[0].strip()
+
+        # 抓取市場別
+        candidates = soup.find_all(['li', 'td'])
+        for tag in candidates:
+            text = tag.text.strip()
+            if '市場' in text:
+                if '上市' in text: data['市場別'] = '上市'; break
+                elif '上櫃' in text: data['市場別'] = '上櫃'; break
+        if data['市場別'] == "未知":
+            if soup.find(string="上市"): data['市場別'] = '上市'
+            elif soup.find(string="上櫃"): data['市場別'] = '上櫃'
 
         # 抓取現價
         price_span = soup.find('span', id='Price1_lbTPrice')
@@ -180,6 +203,7 @@ def fetch_all_etf_data():
             href_code = link['href'].split('/')[-1]
             row_text = row.text.strip()
             
+            # 這裡只要是數字就抓，透過後續標準化處理
             if not href_code[0].isdigit(): continue
             if href_code.upper().endswith(('L', 'R')): continue 
             if any(kw in row_text for kw in china_keywords): continue 
@@ -244,74 +268,10 @@ if not df_final.empty:
         with col2:
             if st.button('🔄 更新'): st.cache_data.clear(); st.rerun()
         
-        market_cols = ['代號', '名稱', '現價', '一季%', '半年%', '一年%', '綜合平均%']
-        df_show = df_final[market_cols].sort_values(by='綜合平均%', ascending=False).reset_index(drop=True)
-        df_show.index += 1
+        # ★ 修正點：把 '市場別' 加回來了
+        market_cols = ['代號', '名稱', '市場別', '現價', '一季%', '半年%', '一年%', '綜合平均%']
         
-        styler = df_show.style.map(style_pl_color, subset=['一季%', '半年%', '一年%', '綜合平均%']) \
-                              .format("{:.2f}", subset=['現價', '一季%', '半年%', '一年%', '綜合平均%'])
-        st.dataframe(styler, use_container_width=True)
-
-    with tab2:
-        if is_logged_in and client:
-            st.subheader(f"{current_user} 的持股管理")
-            
-            with st.expander("➕ 新增持股"):
-                c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-                new_code = c1.text_input("代號 (如 0050)")
-                new_cost = c2.number_input("成交均價", min_value=0.0)
-                new_qty = c3.number_input("股數", min_value=1, step=1)
-                if c4.button("儲存"):
-                    if new_code and new_qty > 0:
-                        save_to_google_sheet(client, current_user, new_code, new_cost, new_qty)
-                        st.success("已儲存！"); time.sleep(1); st.rerun()
-
-            my_df = get_google_sheet_data(client)
-            
-            if not my_df.empty:
-                my_df['代號'] = my_df['代號'].apply(normalize_code)
-                df_final['代號'] = df_final['代號'].apply(normalize_code)
-
-                user_df = my_df[my_df['帳號'] == current_user].copy()
-                
-                if not user_df.empty:
-                    merged_df = pd.merge(user_df, df_final, on='代號', how='left')
-                    
-                    merged_df['現價'] = pd.to_numeric(merged_df['現價'], errors='coerce').fillna(0)
-                    merged_df['成交均價'] = pd.to_numeric(merged_df['成交均價'], errors='coerce').fillna(0)
-                    merged_df['股數'] = pd.to_numeric(merged_df['股數'], errors='coerce').fillna(0)
-                    merged_df['名稱'] = merged_df['名稱'].fillna("未知")
-                    
-                    merged_df['市值'] = merged_df['現價'] * merged_df['股數']
-                    merged_df['總成本'] = merged_df['成交均價'] * merged_df['股數']
-                    merged_df['預估損益'] = merged_df['市值'] - merged_df['總成本']
-                    merged_df['報酬率'] = 0.0
-                    
-                    mask = merged_df['總成本'] > 0
-                    merged_df.loc[mask, '報酬率'] = (merged_df.loc[mask, '預估損益'] / merged_df.loc[mask, '總成本']) * 100
-                    
-                    display_cols = ['代號', '名稱', '股數', '成交均價', '現價', '預估損益', '報酬率']
-                    final_view = merged_df[display_cols].copy()
-                    
-                    st.write("### 持股明細")
-                    styler = final_view.style.format({
-                        '成交均價': "{:.2f}",
-                        '現價': "{:.2f}",
-                        '預估損益': "{:.0f}", 
-                        '報酬率': "{:.2f}%"
-                    }).map(style_pl_color, subset=['預估損益', '報酬率'])
-                    st.dataframe(styler, use_container_width=True)
-                    
-                    st.write("---")
-                    st.write("🗑️ 管理持股")
-                    for idx, row in user_df.iterrows():
-                        if st.button(f"刪除 {row['代號']}", key=f"del_{row['代號']}_{idx}"):
-                            delete_from_google_sheet(client, current_user, row['代號'])
-                            st.rerun()
-
-                else: st.info("尚無持股資料。")
-            else: st.info("讀取資料庫中...")
-        elif not is_logged_in: st.warning("🔒 請先登入")
-        else: st.error("連線錯誤")
-
-else: st.warning("資料載入中...")
+        # 確保欄位存在才顯示
+        existing_cols = [c for c in market_cols if c in df_final.columns]
+        df_show = df_final[existing_cols].sort_values(by='綜合平均%', ascending=False).reset_index(drop=True)
+        df_show.
