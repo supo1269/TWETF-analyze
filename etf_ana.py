@@ -96,7 +96,7 @@ def style_pl_color(val):
 
 def style_top3_rows(row):
     if row.name in [1, 2, 3]:
-        return ['background-color: #ffe6e6'] * len(row)
+        return ['background-color: #fed9b7'] * len(row)
     return [''] * len(row)
 
 # --- 爬蟲核心 ---
