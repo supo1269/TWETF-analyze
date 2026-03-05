@@ -42,7 +42,7 @@ def style_pl_color(val):
         return f'color: {color}; font-weight: bold;'
     return ''
 
-# --- 會員與資料庫系統 (略，保持不變) ---
+# --- 會員系統 ---
 def login_user(username, password):
     try:
         sheet = client.open("ETF_Database").worksheet("users")
@@ -71,6 +71,7 @@ def register_user(username, password, sheet_url):
     except Exception as e:
         return f"error: {e}"
 
+# --- 讀寫個人專屬資料庫 ---
 def get_personal_sheet_data(sheet_url):
     try:
         sheet = client.open_by_url(sheet_url).sheet1
@@ -96,6 +97,7 @@ def update_personal_sheet_batch(sheet_url, new_df):
         sheet = client.open_by_url(sheet_url).sheet1
         final_df = new_df[['代號', '成交均價', '股數']].copy()
         final_df['代號'] = final_df['代號'].astype(str).apply(normalize_code)
+        
         sheet.clear()
         sheet.append_row(['代號', '成交均價', '股數'])
         if not final_df.empty:
@@ -105,51 +107,108 @@ def update_personal_sheet_batch(sheet_url, new_df):
         st.error(f"更新失敗: {e}")
         return False
 
-# --- 爬蟲核心 (強化版：加入配息爬取) ---
-def get_etf_data(stock_code):
+# --- ★ 爬蟲核心 1：排行榜專用 (只抓績效與現價，速度極快) ★ ---
+def get_etf_performance(stock_code):
     url = f"https://histock.tw/stock/{stock_code}"
-    div_url = f"https://histock.tw/stock/dividend/{stock_code}" # 配息專屬頁
     try:
-        data = {'代號': stock_code, '名稱': "未知", '現價': 0.0, '一年配息': 0.0, '綜合平均%': 0.0}
+        response = requests.get(url, headers=headers)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        data = {'代號': stock_code, '名稱': "未知", '市場別': "未知", '現價': 0.0, '一季%': 0.0, '半年%': 0.0, '一年%': 0.0, '綜合平均%': 0.0}
         
-        # 1. 抓現價與名稱
-        resp = requests.get(url, headers=headers)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        name_tag = soup.find('h3')
+        name_tag = soup.find('h3') 
         if name_tag: data['名稱'] = name_tag.text.split('(')[0].strip()
+            
+        for tag in soup.find_all(['li', 'td']):
+            text = tag.text.strip()
+            if '市場' in text:
+                if '上市' in text: data['市場別'] = '上市'; break
+                elif '上櫃' in text: data['市場別'] = '上櫃'; break
+        if data['市場別'] == "未知":
+            if soup.find(string="上市"): data['市場別'] = '上市'
+            elif soup.find(string="上櫃"): data['市場別'] = '上櫃'
+
         price_span = soup.find('span', id='Price1_lbTPrice') or soup.find('span', class_='price')
         if price_span:
             try: data['現價'] = float(price_span.text.replace(',', ''))
             except: pass
+
+        table = soup.find('table', class_='tbPerform')
+        if table:
+            target_periods = {'一季': '一季%', '半年': '半年%', '一年': '一年%'}
+            periods_data = {}
+            for row in table.find_all('tr'):
+                th, td = row.find('th'), row.find('td')
+                if th and td and th.text.strip() in target_periods:
+                    val_span = td.find('span')
+                    if val_span:
+                        try: periods_data[th.text.strip()] = float(val_span.text.replace('%', '').replace('+', '').replace(',', '').strip())
+                        except: pass
             
-        # 2. 抓配息資料 (近一年累計)
+            data['一季%'] = periods_data.get('一季', 0)
+            data['半年%'] = periods_data.get('半年', 0)
+            data['一年%'] = periods_data.get('一年', 0)
+            valid_values = [v for k, v in periods_data.items() if v is not None]
+            if valid_values: data['綜合平均%'] = round(sum(valid_values) / len(valid_values), 2)
+        return data
+    except: return None
+
+# --- ★ 爬蟲核心 2：持股明細專用 (深度爬取近一年配息) ★ ---
+def get_etf_details(stock_code):
+    # 先呼叫上面的函式抓基本資料
+    data = get_etf_performance(stock_code)
+    if not data: return None
+    
+    data['一年配息'] = 0.0
+    # 正確的配息專屬網址
+    div_url = f"https://histock.tw/stock/{stock_code}/%E9%99%A4%E6%AC%8A%E9%99%A4%E6%81%AF"
+    try:
         div_resp = requests.get(div_url, headers=headers)
         div_soup = BeautifulSoup(div_resp.text, 'html.parser')
-        # 尋找「合計」或表格中的現金股利欄位
+        
         div_table = div_soup.find('table', class_='tb-stock')
         if div_table:
             rows = div_table.find_all('tr')
             if len(rows) > 1:
-                # 抓取最近一年的現金股利合計（簡單邏輯：抓取第一列的現金合計）
-                # 注意：各網站結構略不同，這裡取最保險的累計方式
-                tds = rows[1].find_all('td')
-                if len(tds) >= 4:
-                    try: data['一年配息'] = float(tds[4].text.strip()) # 通常合計在第5欄
-                    except: pass
-        
-        # 3. 抓績效 (沿用)
-        perf_table = soup.find('table', class_='tbPerform')
-        if perf_table:
-            vals = []
-            for row in perf_table.find_all('tr'):
-                th, td = row.find('th'), row.find('td')
-                if th and td and th.text.strip() in ['一季', '半年', '一年']:
-                    v = td.find('span')
-                    if v: vals.append(float(v.text.replace('%','').replace('+','').replace(',','')))
-            if vals: data['綜合平均%'] = round(sum(vals)/len(vals), 2)
-            
-        return data
-    except: return None
+                ths = [th.text.strip() for th in rows[0].find_all(['th', 'td'])]
+                
+                cash_idx = -1
+                year_idx = -1
+                
+                # 自動判斷表格欄位位置
+                for i, text in enumerate(ths):
+                    if '現金' in text or '股利' in text: cash_idx = i
+                    if '發放年度' in text or '所屬年度' in text or '年度' in text: year_idx = i
+                
+                if cash_idx != -1:
+                    if year_idx != -1:
+                        # ★ 處理季配息/半年配息：加總同一個「最新年度」的所有配息 ★
+                        latest_year = None
+                        total_div = 0.0
+                        for row in rows[1:]:
+                            tds = row.find_all('td')
+                            if len(tds) > max(cash_idx, year_idx):
+                                y_str = tds[year_idx].text.strip()
+                                c_str = tds[cash_idx].text.strip()
+                                if not latest_year and y_str: 
+                                    latest_year = y_str
+                                
+                                # 只要是最新年度的配息，就一直加總
+                                if y_str == latest_year:
+                                    try: total_div += float(c_str)
+                                    except: pass
+                                else:
+                                    # 遇到舊年度就停止
+                                    if total_div > 0: break
+                        data['一年配息'] = round(total_div, 3)
+                    else:
+                        # 萬一沒有年度，只好直接抓第一筆
+                        tds = rows[1].find_all('td')
+                        if len(tds) > cash_idx:
+                            try: data['一年配息'] = float(tds[cash_idx].text.strip())
+                            except: pass
+    except: pass
+    
+    return data
 
 @st.cache_data(ttl=86400)
 def get_fast_etf_list():
@@ -158,15 +217,35 @@ def get_fast_etf_list():
         response = requests.get(url, headers=headers)
         soup = BeautifulSoup(response.text, 'html.parser')
         etf_options = []
+        china_keywords = ['中國', '上證', '滬', '深', '恒生', 'A50', '香港', '港股']
         for row in soup.find_all('tr'):
             link = row.find('a', href=True)
             if not link or '/stock/' not in link['href']: continue
             href_code = link['href'].split('/')[-1]
-            if not href_code[0].isdigit() or href_code.upper().endswith(('L', 'R')): continue
+            row_text = row.text.strip()
+            if not href_code[0].isdigit() or href_code.upper().endswith(('L', 'R')) or any(kw in row_text for kw in china_keywords): continue
             name_text = link.text.strip()
-            etf_options.append(f"{href_code} {name_text}")
-        return list(set(etf_options))
+            option_str = f"{href_code} {name_text}"
+            if option_str not in etf_options: etf_options.append(option_str)
+        return etf_options
     except: return []
+
+@st.cache_data(ttl=3600, show_spinner="正在掃描全台 ETF 績效中，請稍候 (約 1-2 分鐘)...")
+def fetch_all_etf_data():
+    options = get_fast_etf_list()
+    results = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    for i, opt in enumerate(options):
+        code = opt.split(" ")[0]
+        status_text.text(f"🚀 正在分析 [{i+1}/{len(options)}]: {code} ...")
+        progress_bar.progress((i + 1) / len(options))
+        # 排行榜專用：只抓績效不抓配息，節省時間
+        data = get_etf_performance(code)
+        if data: results.append(data)
+        time.sleep(0.05)
+    status_text.empty(); progress_bar.empty()
+    return pd.DataFrame(results)
 
 # --- 自動登入處理 ---
 if "logged_in" not in st.session_state:
@@ -184,126 +263,222 @@ if not st.session_state["logged_in"] and "user" in st.query_params:
                 break
     except: pass
 
-# --- 側邊欄 ---
+# --- 側邊欄：會員登入/註冊/導覽 ---
 with st.sidebar:
     st.header("⚙️ 系統選單")
+    
     if not st.session_state["logged_in"]:
         auth_mode = st.radio("會員系統", ["登入", "註冊新帳號"], horizontal=True)
+        
         if auth_mode == "登入":
+            st.subheader("🔑 登入")
             username = st.text_input("帳號")
             password = st.text_input("密碼", type="password")
             if st.button("登入系統", use_container_width=True):
-                res = login_user(username, password)
-                if res["success"]:
-                    st.session_state["logged_in"] = True
-                    st.session_state["current_user"] = username
-                    st.session_state["sheet_url"] = res["sheet_url"]
-                    st.query_params["user"] = username
-                    st.rerun()
-                else: st.error(res["msg"])
+                if username and password:
+                    res = login_user(username, password)
+                    if res["success"]:
+                        st.session_state["logged_in"] = True
+                        st.session_state["current_user"] = username
+                        st.session_state["sheet_url"] = res["sheet_url"]
+                        st.query_params["user"] = username
+                        st.success("登入成功！")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error(res["msg"])
+                else: st.warning("請輸入帳號密碼")
+                
         else:
+            st.subheader("📝 註冊")
+            st.markdown("為了保障隱私，本系統採用**自帶資料庫**模式。資料將完全儲存在您自己的 Google 雲端硬碟中。")
+            with st.expander("👉 點我看綁定教學 (必看)", expanded=True):
+                st.markdown(f"""
+                1. 請先去 Google Drive 建立一個**全新的空白試算表**。
+                2. 點擊右上角「共用」。
+                3. 將以下機器人信箱加入，並設為 **「編輯者」**：
+                `{bot_email}`
+                4. 複製該試算表的網址，貼在下方欄位。
+                """)
             new_user = st.text_input("設定帳號")
             new_pass = st.text_input("設定密碼", type="password")
-            new_url = st.text_input("貼上 Google 試算表網址")
+            new_url = st.text_input("貼上您的專屬 Google 試算表網址")
             if st.button("註冊並綁定", use_container_width=True):
-                res = register_user(new_user, new_pass, new_url)
-                if res == "success": st.success("✅ 註冊成功！請登入。")
-                else: st.error(f"錯誤: {res}")
+                if new_user and new_pass and new_url:
+                    with st.spinner("正在驗證試算表權限..."):
+                        res = register_user(new_user, new_pass, new_url)
+                        if res == "success": st.success("✅ 註冊成功！請切換到「登入」。")
+                        elif res == "exists": st.warning("⚠️ 帳號已存在。")
+                        elif res == "no_permission": st.error("❌ 機器人無權限！請確認已共用並設為「編輯者」。")
+                        elif res == "invalid_url": st.error("❌ 網址錯誤。")
+                        else: st.error(f"註冊失敗: {res}")
+                else: st.warning("請填寫所有欄位。")
         page = "📊 市場排行榜"
+        
     else:
-        st.success(f"👋 {st.session_state['current_user']}")
+        st.success(f"👋 歡迎，{st.session_state['current_user']}！")
         if st.button("🚪 登出", use_container_width=True):
             st.session_state["logged_in"] = False
+            st.session_state.pop("sheet_url", None)
             st.query_params.clear()
             st.rerun()
+            
         st.divider()
         page = st.radio("前往頁面", ["💼 我的持股", "📊 市場排行榜"])
 
-# --- 主畫面 ---
-st.title("💰 台股 ETF 資產管家")
+# --- 主畫面邏輯 ---
+st.title("💰 台股 ETF 資產管家 (領息強化版)")
 
 if page == "📊 市場排行榜":
-    st.info("💡 排行榜以綜合績效為主。")
-    # (此部分維持原狀，略過重複程式碼以節省篇幅)
-    st.write("請切換至「我的持股」查看強化版功能！")
+    # 排行榜回來啦！
+    st.subheader("🏆 全台 ETF 績效排行")
+    st.info("💡 這裡會抓取全台灣的 ETF 並計算績效，載入時間較長。")
+    if st.button('🔄 強制更新行情'): st.cache_data.clear(); st.rerun()
+        
+    df_final = fetch_all_etf_data()
+    if not df_final.empty:
+        market_cols = ['代號', '名稱', '市場別', '現價', '一季%', '半年%', '一年%', '綜合平均%']
+        existing_cols = [c for c in market_cols if c in df_final.columns]
+        df_show = df_final[existing_cols].sort_values(by='綜合平均%', ascending=False).reset_index(drop=True)
+        df_show.index += 1
+        
+        styler = df_show.style.map(style_pl_color, subset=['一季%', '半年%', '一年%', '綜合平均%']) \
+                              .format("{:.2f}", subset=['現價', '一季%', '半年%', '一年%', '綜合平均%'])
+        st.dataframe(styler, use_container_width=True, height=600)
 
 elif page == "💼 我的持股":
     if st.session_state["logged_in"]:
+        current_user = st.session_state["current_user"]
         my_sheet_url = st.session_state["sheet_url"]
+        
         user_df = get_personal_sheet_data(my_sheet_url)
         
         if not user_df.empty:
             unique_codes = user_df['代號'].unique()
             my_holdings_data = []
-            with st.spinner("⚡ 正在計算最新行情與配息資訊..."):
+            
+            with st.spinner("⚡ 正在為您計算最新報價與配息資訊..."):
                 for code in unique_codes:
-                    data = get_etf_data(code)
+                    # 持股專用：進入深度爬蟲抓配息
+                    data = get_etf_details(code)
                     if data: my_holdings_data.append(data)
             
             if my_holdings_data:
-                merged_df = pd.merge(user_df, pd.DataFrame(my_holdings_data), on='代號', how='left')
+                current_prices_df = pd.DataFrame(my_holdings_data)
+                merged_df = pd.merge(user_df, current_prices_df, on='代號', how='left')
+                
+                merged_df['現價'] = pd.to_numeric(merged_df['現價'], errors='coerce').fillna(0)
                 merged_df['股數'] = pd.to_numeric(merged_df['股數'], errors='coerce').fillna(0)
                 merged_df['現值'] = merged_df['現價'] * merged_df['股數']
                 merged_df['總成本'] = merged_df['成交均價'] * merged_df['股數']
                 merged_df['預估損益'] = merged_df['現值'] - merged_df['總成本']
+                merged_df['報酬率%'] = 0.0
+                mask = merged_df['總成本'] > 0
+                merged_df.loc[mask, '報酬率%'] = (merged_df.loc[mask, '預估損益'] / merged_df.loc[mask, '總成本']) * 100
                 
-                # --- ★ 領息核心計算 ★ ---
+                # --- ★ 存股族專屬：領息計算邏輯 ★ ---
                 merged_df['年領息'] = merged_df['一年配息'] * merged_df['股數']
-                merged_df['成本殖利率%'] = (merged_df['一年配息'] / merged_df['成交均價'] * 100).fillna(0)
+                merged_df['成本殖利率%'] = 0.0
+                mask_cost = merged_df['成交均價'] > 0
+                merged_df.loc[mask_cost, '成本殖利率%'] = (merged_df.loc[mask_cost, '一年配息'] / merged_df.loc[mask_cost, '成交均價']) * 100
                 
-                merged_df = merged_df.sort_values(by='代號').reset_index(drop=True)
+                merged_df = merged_df.sort_values(by='代號', ascending=True).reset_index(drop=True)
                 
                 # --- 左右配置儀表板 ---
                 dash_col1, dash_col2 = st.columns([1, 1.5])
+                
                 with dash_col1:
-                    st.write("### 📊 資產總覽")
+                    st.write("### 📊 資產與配息總覽")
                     total_value = merged_df['現值'].sum()
                     total_pnl = merged_df['預估損益'].sum()
-                    total_div = merged_df['年領息'].sum() # 總領息
+                    total_cost = merged_df['總成本'].sum()
+                    total_roi = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+                    total_div = merged_df['年領息'].sum()
+                    monthly_div = total_div / 12
                     
                     st.metric("總市值", f"${total_value:,.0f}")
-                    st.metric("預估年領息", f"${total_div:,.0f}", help="根據近一年配息累計計算")
+                    st.metric("預估年領息", f"${total_div:,.0f}", help="根據該檔ETF近一年的配息累計計算")
                     st.metric("總損益", f"${total_pnl:,.0f}", delta=f"{total_pnl:,.0f}")
-                    st.metric("月平均被動收入", f"${(total_div/12):,.0f}")
+                    st.metric("每月平均被動收入", f"${monthly_div:,.0f}")
 
                 with dash_col2:
                     st.write("### 🍩 資產配置")
-                    fig = px.pie(merged_df[merged_df['現值']>0], values='現值', names='名稱', hole=0.4)
-                    fig.update_layout(margin=dict(t=10, b=10, l=10, r=10))
-                    st.plotly_chart(fig, use_container_width=True)
+                    pie_df = merged_df[merged_df['現值'] > 0]
+                    if not pie_df.empty:
+                        fig = px.pie(
+                            pie_df, 
+                            values='現值', 
+                            names='名稱', 
+                            hole=0.4,
+                            hover_data=['代號', '現值'],
+                            color_discrete_sequence=px.colors.qualitative.Pastel 
+                        )
+                        fig.update_traces(textposition='inside', textinfo='percent+label')
+                        fig.update_layout(margin=dict(t=10, b=10, l=10, r=10)) 
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.caption("💡 提示：點擊右側圖例 (Legend) 可以暫時隱藏/顯示特定 ETF 來重算佔比喔！")
+                    else:
+                        st.info("請至少選擇一檔有現值的持股來顯示圓餅圖。")
 
                 st.divider()
                 
-                # --- 強化版持股明細 ---
-                st.write("### 📄 持股與配息明細")
+                # --- 持股與配息明細表格 ---
+                st.write("### 📄 持股明細")
                 view_cols = ['代號', '名稱', '股數', '成交均價', '現價', '現值', '預估損益', '一年配息', '年領息', '成本殖利率%']
                 view_styler = merged_df[view_cols].style.format({
                     '成交均價': "{:.2f}", '現價': "{:.2f}", '現值': "{:,.0f}",
                     '預估損益': "{:,.0f}", '一年配息': "{:.2f}", '年領息': "{:,.0f}", '成本殖利率%': "{:.2f}%"
                 }).map(style_pl_color, subset=['預估損益', '成本殖利率%'])
+                
                 st.dataframe(view_styler, use_container_width=True)
+                
+            else: st.info("目前無有效報價資料。")
+        else: 
+            st.info("您目前尚未建立任何持股。可以從下方管理區新增！")
 
-        # --- 管理區 (新增/編輯) ---
+        # --- 下半部：持股管理區 ---
         st.divider()
         st.write("### ⚙️ 持股管理")
         fast_etf_options = get_fast_etf_list()
         
-        with st.expander("➕ 新增持股"):
+        with st.expander("➕ 新增持股", expanded=False):
             c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-            selected_etf = c1.selectbox("選擇 ETF", options=fast_etf_options, index=None)
+            selected_etf = c1.selectbox("選擇 ETF", options=fast_etf_options, index=None, placeholder="請搜尋...")
             new_cost = c2.number_input("成交均價", min_value=0.0)
             new_qty = c3.number_input("股數", min_value=1, step=1)
-            if c4.button("儲存"):
-                if selected_etf:
-                    save_to_personal_sheet(my_sheet_url, selected_etf.split(" ")[0], new_cost, new_qty)
-                    st.rerun()
+            
+            if c4.button("儲存新持股"):
+                if selected_etf and new_qty > 0:
+                    code_to_save = selected_etf.split(" ")[0]
+                    if save_to_personal_sheet(my_sheet_url, code_to_save, new_cost, new_qty):
+                        st.success(f"已新增 {code_to_save}！")
+                        time.sleep(1); st.rerun()
+                    else: st.error("儲存失敗，請檢查權限。")
+                else: st.warning("資料不完整")
 
-        if not user_df.empty:
-            with st.expander("🛠️ 編輯 / 刪除"):
-                edit_df = merged_df[['代號', '名稱', '股數', '成交均價']].copy()
-                edit_df.insert(0, '刪除', False)
-                edited = st.data_editor(edit_df, hide_index=True)
-                if st.button("💾 儲存變更"):
-                    update_personal_sheet_batch(my_sheet_url, edited[edited['刪除']==False][['代號', '成交均價', '股數']])
-                    st.rerun()
-    else: st.warning("請登入。")
+        if not user_df.empty and 'merged_df' in locals():
+            with st.expander("🛠️ 編輯 / 刪除現有持股", expanded=False):
+                merged_df['刪除'] = False
+                edit_df = merged_df[['刪除', '代號', '名稱', '股數', '成交均價']].copy()
+                
+                edited_df = st.data_editor(
+                    edit_df,
+                    column_config={
+                        "刪除": st.column_config.CheckboxColumn("刪除?", default=False),
+                        "代號": st.column_config.TextColumn("代號", disabled=True),
+                        "名稱": st.column_config.TextColumn("名稱", disabled=True),
+                        "股數": st.column_config.NumberColumn("股數", min_value=1, step=1, format="%d"),
+                        "成交均價": st.column_config.NumberColumn("成交均價", min_value=0.0, format="%.2f"),
+                    },
+                    hide_index=True, use_container_width=True
+                )
+                
+                if st.button("💾 儲存變更", type="primary"):
+                    rows_to_save = edited_df[edited_df['刪除'] == False]
+                    df_to_save = rows_to_save[['代號', '成交均價', '股數']].copy()
+                    if update_personal_sheet_batch(my_sheet_url, df_to_save):
+                        st.success("✅ 更新成功！")
+                        time.sleep(1); st.rerun()
+                    else: st.error("存檔失敗。")
+
+    else: st.warning("請先從左側選單登入系統。")
