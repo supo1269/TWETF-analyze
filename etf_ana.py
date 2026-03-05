@@ -291,25 +291,11 @@ elif page == "💼 我的持股":
         current_user = st.session_state["current_user"]
         my_sheet_url = st.session_state["sheet_url"]
         
-        fast_etf_options = get_fast_etf_list()
-        
-        with st.expander("➕ 新增持股", expanded=False):
-            c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-            selected_etf = c1.selectbox("選擇 ETF", options=fast_etf_options, index=None, placeholder="請搜尋...")
-            new_cost = c2.number_input("成交均價", min_value=0.0)
-            new_qty = c3.number_input("股數", min_value=1, step=1)
-            
-            if c4.button("儲存"):
-                if selected_etf and new_qty > 0:
-                    code_to_save = selected_etf.split(" ")[0]
-                    if save_to_personal_sheet(my_sheet_url, code_to_save, new_cost, new_qty):
-                        st.success(f"已新增 {code_to_save}！")
-                        time.sleep(1); st.rerun()
-                    else: st.error("儲存失敗，請檢查權限。")
-                else: st.warning("資料不完整")
-
         user_df = get_personal_sheet_data(my_sheet_url)
         
+        # -----------------------------------------------------
+        # 上半部：資產儀表板與持股明細 (只在有資料時顯示)
+        # -----------------------------------------------------
         if not user_df.empty:
             unique_codes = user_df['代號'].unique()
             my_holdings_data = []
@@ -332,38 +318,43 @@ elif page == "💼 我的持股":
                 mask = merged_df['總成本'] > 0
                 merged_df.loc[mask, '報酬率%'] = (merged_df.loc[mask, '預估損益'] / merged_df.loc[mask, '總成本']) * 100
                 
-                # ★ 排序修改：根據「代號」由小到大自動排序！ ★
                 merged_df = merged_df.sort_values(by='代號', ascending=True).reset_index(drop=True)
                 
-                total_pnl = merged_df['預估損益'].sum()
-                total_value = merged_df['現值'].sum()
-                total_cost = merged_df['總成本'].sum()
-                total_roi = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+                # --- ★ 全新：左右配置儀表板 ★ ---
+                dash_col1, dash_col2 = st.columns([1, 1.5])
                 
-                # --- 儀表板區 ---
-                k1, k2, k3 = st.columns(3)
-                k1.metric("總市值", f"${total_value:,.0f}")
-                k2.metric("總損益", f"${total_pnl:,.0f}", delta=f"{total_pnl:,.0f}")
-                k3.metric("總報酬率", f"{total_roi:.2f}%", delta=f"{total_roi:.2f}%")
-                
-                st.divider()
+                # 左邊：總計數字區
+                with dash_col1:
+                    st.write("### 📊 資產總覽")
+                    total_pnl = merged_df['預估損益'].sum()
+                    total_value = merged_df['現值'].sum()
+                    total_cost = merged_df['總成本'].sum()
+                    total_roi = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+                    
+                    st.metric("總市值", f"${total_value:,.0f}")
+                    st.metric("總損益", f"${total_pnl:,.0f}", delta=f"{total_pnl:,.0f}")
+                    st.metric("總報酬率", f"{total_roi:.2f}%", delta=f"{total_roi:.2f}%")
 
-                # --- 資產配置圓餅圖 ---
-                st.write("### 🍩 資產配置圓餅圖")
-                pie_df = merged_df[merged_df['現值'] > 0] 
-                if not pie_df.empty:
-                    fig = px.pie(
-                        pie_df, 
-                        values='現值', 
-                        names='名稱', 
-                        hole=0.4,
-                        hover_data=['代號', '現值'],
-                        color_discrete_sequence=px.colors.qualitative.Pastel 
-                    )
-                    fig.update_traces(textposition='inside', textinfo='percent+label')
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("尚無有效的資產數據可以產生圓餅圖。")
+                # 右邊：互動式圓餅圖區
+                with dash_col2:
+                    st.write("### 🍩 資產配置")
+                    pie_df = merged_df[merged_df['現值'] > 0]
+                    
+                    if not pie_df.empty:
+                        fig = px.pie(
+                            pie_df, 
+                            values='現值', 
+                            names='名稱', 
+                            hole=0.4,
+                            hover_data=['代號', '現值'],
+                            color_discrete_sequence=px.colors.qualitative.Pastel 
+                        )
+                        fig.update_traces(textposition='inside', textinfo='percent+label')
+                        fig.update_layout(margin=dict(t=10, b=10, l=10, r=10)) # 縮減邊距
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.caption("💡 提示：點擊右側圖例 (Legend) 可以暫時隱藏/顯示特定 ETF 來重算佔比喔！")
+                    else:
+                        st.info("請至少選擇一檔有現值的持股來顯示圓餅圖。")
 
                 st.divider()
                 
@@ -377,30 +368,58 @@ elif page == "💼 我的持股":
                 
                 st.dataframe(view_styler, use_container_width=True)
                 
-                # --- 編輯區 ---
-                with st.expander("🛠️ 編輯/刪除持股", expanded=False):
-                    merged_df['刪除'] = False
-                    edit_df = merged_df[['刪除', '代號', '名稱', '股數', '成交均價']].copy()
-                    
-                    edited_df = st.data_editor(
-                        edit_df,
-                        column_config={
-                            "刪除": st.column_config.CheckboxColumn("刪除?", default=False),
-                            "代號": st.column_config.TextColumn("代號", disabled=True),
-                            "名稱": st.column_config.TextColumn("名稱", disabled=True),
-                            "股數": st.column_config.NumberColumn("股數", min_value=1, step=1, format="%d"),
-                            "成交均價": st.column_config.NumberColumn("成交均價", min_value=0.0, format="%.2f"),
-                        },
-                        hide_index=True, use_container_width=True
-                    )
-                    
-                    if st.button("💾 儲存變更", type="primary"):
-                        rows_to_save = edited_df[edited_df['刪除'] == False]
-                        df_to_save = rows_to_save[['代號', '成交均價', '股數']].copy()
-                        if update_personal_sheet_batch(my_sheet_url, df_to_save):
-                            st.success("✅ 更新成功！")
-                            time.sleep(1); st.rerun()
-                        else: st.error("存檔失敗。")
             else: st.info("目前無有效報價資料。")
-        else: st.info("您目前尚未建立任何持股。可以從上方新增！")
+        else: 
+            st.info("您目前尚未建立任何持股。可以從下方管理區新增！")
+
+        # -----------------------------------------------------
+        # 下半部：持股管理區 (新增 / 編輯 / 刪除)
+        # -----------------------------------------------------
+        st.divider()
+        st.write("### ⚙️ 持股管理")
+        
+        fast_etf_options = get_fast_etf_list()
+        
+        # 1. 新增持股區
+        with st.expander("➕ 新增持股", expanded=False):
+            c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+            selected_etf = c1.selectbox("選擇 ETF", options=fast_etf_options, index=None, placeholder="請搜尋...")
+            new_cost = c2.number_input("成交均價", min_value=0.0)
+            new_qty = c3.number_input("股數", min_value=1, step=1)
+            
+            if c4.button("儲存新持股"):
+                if selected_etf and new_qty > 0:
+                    code_to_save = selected_etf.split(" ")[0]
+                    if save_to_personal_sheet(my_sheet_url, code_to_save, new_cost, new_qty):
+                        st.success(f"已新增 {code_to_save}！")
+                        time.sleep(1); st.rerun()
+                    else: st.error("儲存失敗，請檢查權限。")
+                else: st.warning("資料不完整")
+
+        # 2. 編輯與刪除持股區
+        if not user_df.empty and 'merged_df' in locals():
+            with st.expander("🛠️ 編輯 / 刪除現有持股", expanded=False):
+                merged_df['刪除'] = False
+                edit_df = merged_df[['刪除', '代號', '名稱', '股數', '成交均價']].copy()
+                
+                edited_df = st.data_editor(
+                    edit_df,
+                    column_config={
+                        "刪除": st.column_config.CheckboxColumn("刪除?", default=False),
+                        "代號": st.column_config.TextColumn("代號", disabled=True),
+                        "名稱": st.column_config.TextColumn("名稱", disabled=True),
+                        "股數": st.column_config.NumberColumn("股數", min_value=1, step=1, format="%d"),
+                        "成交均價": st.column_config.NumberColumn("成交均價", min_value=0.0, format="%.2f"),
+                    },
+                    hide_index=True, use_container_width=True
+                )
+                
+                if st.button("💾 儲存變更", type="primary"):
+                    rows_to_save = edited_df[edited_df['刪除'] == False]
+                    df_to_save = rows_to_save[['代號', '成交均價', '股數']].copy()
+                    if update_personal_sheet_batch(my_sheet_url, df_to_save):
+                        st.success("✅ 更新成功！")
+                        time.sleep(1); st.rerun()
+                    else: st.error("存檔失敗。")
+
     else: st.warning("請先從左側選單登入系統。")
