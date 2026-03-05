@@ -5,6 +5,7 @@ import pandas as pd
 import time
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import plotly.express as px
 
 # --- 網頁設定 ---
 st.set_page_config(page_title="台股 ETF 資產管家 (隱私升級版)", layout="wide")
@@ -117,14 +118,11 @@ def get_etf_return(stock_code):
         name_tag = soup.find('h3') 
         if name_tag: data['名稱'] = name_tag.text.split('(')[0].strip()
             
-        # ★ 修正點：加回了市場別的備用搜尋邏輯
         for tag in soup.find_all(['li', 'td']):
             text = tag.text.strip()
             if '市場' in text:
                 if '上市' in text: data['市場別'] = '上市'; break
                 elif '上櫃' in text: data['市場別'] = '上櫃'; break
-        
-        # 備用方案：如果上面沒抓到，直接在網頁找字眼
         if data['市場別'] == "未知":
             if soup.find(string="上市"): data['市場別'] = '上市'
             elif soup.find(string="上櫃"): data['市場別'] = '上櫃'
@@ -190,12 +188,11 @@ def fetch_all_etf_data():
     status_text.empty(); progress_bar.empty()
     return pd.DataFrame(results)
 
-# --- ★ 自動登入處理邏輯 (解決 F5 重新整理會登出的問題) ★ ---
+# --- 自動登入處理 ---
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 
 if not st.session_state["logged_in"] and "user" in st.query_params:
-    # 發現網址有 user 參數，嘗試自動登入
     auto_user = st.query_params["user"]
     try:
         users_records = client.open("ETF_Database").worksheet("users").get_all_records()
@@ -225,10 +222,7 @@ with st.sidebar:
                         st.session_state["logged_in"] = True
                         st.session_state["current_user"] = username
                         st.session_state["sheet_url"] = res["sheet_url"]
-                        
-                        # ★ 登入成功時，把帳號加到網址參數裡面 (記住我)
                         st.query_params["user"] = username
-                        
                         st.success("登入成功！")
                         time.sleep(1)
                         st.rerun()
@@ -267,8 +261,6 @@ with st.sidebar:
         if st.button("🚪 登出", use_container_width=True):
             st.session_state["logged_in"] = False
             st.session_state.pop("sheet_url", None)
-            
-            # ★ 登出時，把網址參數清空
             st.query_params.clear()
             st.rerun()
             
@@ -340,16 +332,43 @@ elif page == "💼 我的持股":
                 mask = merged_df['總成本'] > 0
                 merged_df.loc[mask, '報酬率%'] = (merged_df.loc[mask, '預估損益'] / merged_df.loc[mask, '總成本']) * 100
                 
+                # ★ 排序修改：根據「代號」由小到大自動排序！ ★
+                merged_df = merged_df.sort_values(by='代號', ascending=True).reset_index(drop=True)
+                
                 total_pnl = merged_df['預估損益'].sum()
                 total_value = merged_df['現值'].sum()
                 total_cost = merged_df['總成本'].sum()
                 total_roi = (total_pnl / total_cost * 100) if total_cost > 0 else 0
                 
+                # --- 儀表板區 ---
                 k1, k2, k3 = st.columns(3)
                 k1.metric("總市值", f"${total_value:,.0f}")
                 k2.metric("總損益", f"${total_pnl:,.0f}", delta=f"{total_pnl:,.0f}")
                 k3.metric("總報酬率", f"{total_roi:.2f}%", delta=f"{total_roi:.2f}%")
                 
+                st.divider()
+
+                # --- 資產配置圓餅圖 ---
+                st.write("### 🍩 資產配置圓餅圖")
+                pie_df = merged_df[merged_df['現值'] > 0] 
+                if not pie_df.empty:
+                    fig = px.pie(
+                        pie_df, 
+                        values='現值', 
+                        names='名稱', 
+                        hole=0.4,
+                        hover_data=['代號', '現值'],
+                        color_discrete_sequence=px.colors.qualitative.Pastel 
+                    )
+                    fig.update_traces(textposition='inside', textinfo='percent+label')
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("尚無有效的資產數據可以產生圓餅圖。")
+
+                st.divider()
+                
+                # --- 持股明細表格 ---
+                st.write("### 📄 持股明細")
                 view_cols = ['代號', '名稱', '股數', '成交均價', '現價', '現值', '預估損益', '報酬率%']
                 view_styler = merged_df[view_cols].style.format({
                     '成交均價': "{:.2f}", '現價': "{:.2f}", '現值': "{:,.0f}",
@@ -357,8 +376,8 @@ elif page == "💼 我的持股":
                 }).map(style_pl_color, subset=['預估損益', '報酬率%'])
                 
                 st.dataframe(view_styler, use_container_width=True)
-                st.divider()
                 
+                # --- 編輯區 ---
                 with st.expander("🛠️ 編輯/刪除持股", expanded=False):
                     merged_df['刪除'] = False
                     edit_df = merged_df[['刪除', '代號', '名稱', '股數', '成交均價']].copy()
