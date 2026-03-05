@@ -41,14 +41,13 @@ def style_pl_color(val):
         return f'color: {color}; font-weight: bold;'
     return ''
 
-# --- ★ 方案B：全新的會員系統 (綁定個人試算表) ★ ---
+# --- 會員系統 ---
 def login_user(username, password):
     try:
         sheet = client.open("ETF_Database").worksheet("users")
         users = sheet.get_all_records()
         for u in users:
             if str(u.get('username')) == username and str(u.get('password')) == password:
-                # 登入成功，回傳使用者的專屬試算表網址
                 return {"success": True, "sheet_url": str(u.get('sheet_url'))}
         return {"success": False, "msg": "帳號或密碼錯誤"}
     except Exception as e:
@@ -60,25 +59,20 @@ def register_user(username, password, sheet_url):
         users = sheet.get_all_records()
         if any(str(u.get('username')) == username for u in users):
             return "exists"
-        
-        # 測試一下這個網址有沒有共用給機器人
         try:
             test_open = client.open_by_url(sheet_url)
         except gspread.exceptions.APIError:
             return "no_permission"
         except Exception:
             return "invalid_url"
-
         sheet.append_row([username, password, sheet_url])
         return "success"
     except Exception as e:
         return f"error: {e}"
 
-# --- ★ 方案B：讀寫個人專屬資料庫 ★ ---
-# 現在不需要傳 username 了，直接傳個人的 sheet_url！
+# --- 讀寫個人專屬資料庫 ---
 def get_personal_sheet_data(sheet_url):
     try:
-        # 直接抓取該網址的第一個工作表 (sheet1)，使用者連改名都不用！
         sheet = client.open_by_url(sheet_url).sheet1
         data = sheet.get_all_records()
         df = pd.DataFrame(data)
@@ -91,7 +85,6 @@ def get_personal_sheet_data(sheet_url):
 def save_to_personal_sheet(sheet_url, code, cost, qty):
     try:
         sheet = client.open_by_url(sheet_url).sheet1
-        # 如果是空白表，先塞標題
         if not sheet.get_all_values():
             sheet.append_row(['代號', '成交均價', '股數'])
         sheet.append_row([code, cost, qty])
@@ -99,7 +92,6 @@ def save_to_personal_sheet(sheet_url, code, cost, qty):
     except: return False
 
 def update_personal_sheet_batch(sheet_url, new_df):
-    """因為是專屬表格，直接清空重寫就好，邏輯超級簡單！"""
     try:
         sheet = client.open_by_url(sheet_url).sheet1
         final_df = new_df[['代號', '成交均價', '股數']].copy()
@@ -114,7 +106,7 @@ def update_personal_sheet_batch(sheet_url, new_df):
         st.error(f"更新失敗: {e}")
         return False
 
-# --- 爬蟲核心 (維持極速版邏輯) ---
+# --- 爬蟲核心 ---
 def get_etf_return(stock_code):
     url = f"https://histock.tw/stock/{stock_code}"
     try:
@@ -125,11 +117,17 @@ def get_etf_return(stock_code):
         name_tag = soup.find('h3') 
         if name_tag: data['名稱'] = name_tag.text.split('(')[0].strip()
             
+        # ★ 修正點：加回了市場別的備用搜尋邏輯
         for tag in soup.find_all(['li', 'td']):
             text = tag.text.strip()
             if '市場' in text:
                 if '上市' in text: data['市場別'] = '上市'; break
                 elif '上櫃' in text: data['市場別'] = '上櫃'; break
+        
+        # 備用方案：如果上面沒抓到，直接在網頁找字眼
+        if data['市場別'] == "未知":
+            if soup.find(string="上市"): data['市場別'] = '上市'
+            elif soup.find(string="上櫃"): data['市場別'] = '上櫃'
 
         price_span = soup.find('span', id='Price1_lbTPrice') or soup.find('span', class_='price')
         if price_span:
@@ -192,11 +190,24 @@ def fetch_all_etf_data():
     status_text.empty(); progress_bar.empty()
     return pd.DataFrame(results)
 
-# --- 側邊欄：會員登入/註冊/導覽 ---
-
+# --- ★ 自動登入處理邏輯 (解決 F5 重新整理會登出的問題) ★ ---
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 
+if not st.session_state["logged_in"] and "user" in st.query_params:
+    # 發現網址有 user 參數，嘗試自動登入
+    auto_user = st.query_params["user"]
+    try:
+        users_records = client.open("ETF_Database").worksheet("users").get_all_records()
+        for u in users_records:
+            if str(u.get('username')) == auto_user:
+                st.session_state["logged_in"] = True
+                st.session_state["current_user"] = auto_user
+                st.session_state["sheet_url"] = str(u.get('sheet_url'))
+                break
+    except: pass
+
+# --- 側邊欄：會員登入/註冊/導覽 ---
 with st.sidebar:
     st.header("⚙️ 系統選單")
     
@@ -213,7 +224,11 @@ with st.sidebar:
                     if res["success"]:
                         st.session_state["logged_in"] = True
                         st.session_state["current_user"] = username
-                        st.session_state["sheet_url"] = res["sheet_url"] # 記住專屬網址
+                        st.session_state["sheet_url"] = res["sheet_url"]
+                        
+                        # ★ 登入成功時，把帳號加到網址參數裡面 (記住我)
+                        st.query_params["user"] = username
+                        
                         st.success("登入成功！")
                         time.sleep(1)
                         st.rerun()
@@ -223,34 +238,28 @@ with st.sidebar:
                 
         else:
             st.subheader("📝 註冊")
-            st.markdown("為了保障您的隱私，本系統採用**自帶資料庫**模式。您的資產資料將完全儲存在您自己的 Google 雲端硬碟中。")
-            
-            # ★ 註冊教學步驟 ★
+            st.markdown("為了保障隱私，本系統採用**自帶資料庫**模式。資料將完全儲存在您自己的 Google 雲端硬碟中。")
             with st.expander("👉 點我看綁定教學 (必看)", expanded=True):
                 st.markdown(f"""
-                1. 請先去您的 Google Drive 建立一個**全新的空白試算表**。
-                2. 點擊右上角的「共用」。
-                3. 將以下機器人信箱加入，並將權限設為 **「編輯者」**：
+                1. 請先去 Google Drive 建立一個**全新的空白試算表**。
+                2. 點擊右上角「共用」。
+                3. 將以下機器人信箱加入，並設為 **「編輯者」**：
                 `{bot_email}`
                 4. 複製該試算表的網址，貼在下方欄位。
                 """)
-            
             new_user = st.text_input("設定帳號")
             new_pass = st.text_input("設定密碼", type="password")
             new_url = st.text_input("貼上您的專屬 Google 試算表網址")
-            
             if st.button("註冊並綁定", use_container_width=True):
                 if new_user and new_pass and new_url:
                     with st.spinner("正在驗證試算表權限..."):
                         res = register_user(new_user, new_pass, new_url)
-                        if res == "success":
-                            st.success("✅ 註冊成功！資料庫已連線，請切換到「登入」。")
+                        if res == "success": st.success("✅ 註冊成功！請切換到「登入」。")
                         elif res == "exists": st.warning("⚠️ 帳號已存在。")
-                        elif res == "no_permission": st.error("❌ 機器人無法存取該試算表！請確認是否已共用並設為「編輯者」。")
-                        elif res == "invalid_url": st.error("❌ 試算表網址格式錯誤。")
+                        elif res == "no_permission": st.error("❌ 機器人無權限！請確認已共用並設為「編輯者」。")
+                        elif res == "invalid_url": st.error("❌ 網址錯誤。")
                         else: st.error(f"註冊失敗: {res}")
                 else: st.warning("請填寫所有欄位。")
-                    
         page = "📊 市場排行榜"
         
     else:
@@ -258,13 +267,15 @@ with st.sidebar:
         if st.button("🚪 登出", use_container_width=True):
             st.session_state["logged_in"] = False
             st.session_state.pop("sheet_url", None)
+            
+            # ★ 登出時，把網址參數清空
+            st.query_params.clear()
             st.rerun()
             
         st.divider()
         page = st.radio("前往頁面", ["💼 我的持股", "📊 市場排行榜"])
 
 # --- 主畫面邏輯 ---
-
 st.title("💰 台股 ETF 資產管家 (隱私升級版)")
 
 if page == "📊 市場排行榜":
@@ -286,7 +297,7 @@ if page == "📊 市場排行榜":
 elif page == "💼 我的持股":
     if st.session_state["logged_in"]:
         current_user = st.session_state["current_user"]
-        my_sheet_url = st.session_state["sheet_url"] # 取出專屬網址
+        my_sheet_url = st.session_state["sheet_url"]
         
         fast_etf_options = get_fast_etf_list()
         
@@ -299,14 +310,12 @@ elif page == "💼 我的持股":
             if c4.button("儲存"):
                 if selected_etf and new_qty > 0:
                     code_to_save = selected_etf.split(" ")[0]
-                    # 直接存入專屬網址
                     if save_to_personal_sheet(my_sheet_url, code_to_save, new_cost, new_qty):
                         st.success(f"已新增 {code_to_save}！")
                         time.sleep(1); st.rerun()
                     else: st.error("儲存失敗，請檢查權限。")
                 else: st.warning("資料不完整")
 
-        # 讀取專屬資料庫 (不再需要過濾帳號！)
         user_df = get_personal_sheet_data(my_sheet_url)
         
         if not user_df.empty:
@@ -331,7 +340,6 @@ elif page == "💼 我的持股":
                 mask = merged_df['總成本'] > 0
                 merged_df.loc[mask, '報酬率%'] = (merged_df.loc[mask, '預估損益'] / merged_df.loc[mask, '總成本']) * 100
                 
-                # --- 儀表板區 ---
                 total_pnl = merged_df['預估損益'].sum()
                 total_value = merged_df['現值'].sum()
                 total_cost = merged_df['總成本'].sum()
@@ -351,7 +359,6 @@ elif page == "💼 我的持股":
                 st.dataframe(view_styler, use_container_width=True)
                 st.divider()
                 
-                # --- 編輯區 ---
                 with st.expander("🛠️ 編輯/刪除持股", expanded=False):
                     merged_df['刪除'] = False
                     edit_df = merged_df[['刪除', '代號', '名稱', '股數', '成交均價']].copy()
