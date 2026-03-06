@@ -3,6 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import time
+import re  # ★ 新增：強大的正則表達式套件，用來抓年份
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import plotly.express as px
@@ -107,7 +108,7 @@ def update_personal_sheet_batch(sheet_url, new_df):
         st.error(f"更新失敗: {e}")
         return False
 
-# --- ★ 爬蟲核心 1：排行榜專用 (加上快取，一小時內不再重爬) ★ ---
+# --- ★ 爬蟲核心 1：排行榜專用 ★ ---
 @st.cache_data(ttl=3600)
 def get_etf_performance(stock_code):
     url = f"https://histock.tw/stock/{stock_code}"
@@ -153,7 +154,7 @@ def get_etf_performance(stock_code):
         return data
     except: return None
 
-# --- ★ 爬蟲核心 2：持股明細專用 (加上快取，秒切換分頁的關鍵) ★ ---
+# --- ★ 爬蟲核心 2：持股明細專用 (暴力防呆版) ★ ---
 @st.cache_data(ttl=3600)
 def get_etf_details(stock_code):
     data = get_etf_performance(stock_code)
@@ -165,8 +166,9 @@ def get_etf_details(stock_code):
         div_resp = requests.get(div_url, headers=headers)
         div_soup = BeautifulSoup(div_resp.text, 'html.parser')
         
-        div_table = div_soup.find('table', class_='tb-stock')
-        if div_table:
+        # 尋找所有可能的表格
+        div_tables = div_soup.find_all('table', class_='tb-stock')
+        for div_table in div_tables:
             rows = div_table.find_all('tr')
             if len(rows) > 1:
                 ths = [th.text.strip() for th in rows[0].find_all(['th', 'td'])]
@@ -174,34 +176,46 @@ def get_etf_details(stock_code):
                 cash_idx = -1
                 year_idx = -1
                 
+                # 精準定位欄位
                 for i, text in enumerate(ths):
-                    if '現金' in text: 
-                        cash_idx = i
-                    elif '年度' in text:
-                        if year_idx == -1: year_idx = i
+                    # 必須是現金股利
+                    if '現金' in text or '除息' in text: 
+                        if cash_idx == -1: cash_idx = i
+                    # 找發放年度
+                    if '發放年度' in text:
+                        year_idx = i
                 
+                # 如果找不到發放年度，隨便找有「年度」或「日期」的
+                if year_idx == -1:
+                    for i, text in enumerate(ths):
+                        if '年度' in text or '除權息日' in text or '除息日' in text:
+                            year_idx = i
+                            break
+                            
                 if cash_idx != -1 and year_idx != -1:
                     year_divs = {}
                     for row in rows[1:]:
                         tds = row.find_all('td')
                         if len(tds) > max(cash_idx, year_idx):
-                            y_str = tds[year_idx].text.strip()
+                            y_raw = tds[year_idx].text.strip()
                             c_str = tds[cash_idx].text.strip()
-                            if y_str and c_str:
+                            
+                            # ★ 終極武器：正則表達式，強制從字串中抓出 20XX 的數字 ★
+                            match = re.search(r'(20\d{2})', y_raw)
+                            if match and c_str:
+                                y_str = match.group(1) # 取出 2024、2023 這樣的純數字
                                 try:
-                                    year_divs[y_str] = year_divs.get(y_str, 0.0) + float(c_str)
+                                    val = float(c_str)
+                                    year_divs[y_str] = year_divs.get(y_str, 0.0) + val
                                 except: pass
                     
                     if year_divs:
                         sorted_years = sorted(year_divs.keys(), reverse=True)
-                        recent_years = sorted_years[:3]
-                        data['一年配息'] = round(max([year_divs[y] for y in recent_years]), 3)
-                else:
-                    if cash_idx != -1:
-                        tds = rows[1].find_all('td')
-                        if len(tds) > cash_idx:
-                            try: data['一年配息'] = float(tds[cash_idx].text.strip())
-                            except: pass
+                        recent_years = sorted_years[:3] # 取近三年
+                        if recent_years:
+                            # 找出這三年裡面總配息最高的數字
+                            data['一年配息'] = round(max([year_divs[y] for y in recent_years]), 3)
+                        break # 找到了就跳出迴圈
     except: pass
     
     return data
@@ -345,13 +359,11 @@ elif page == "💼 我的持股":
         current_user = st.session_state["current_user"]
         my_sheet_url = st.session_state["sheet_url"]
         
-        # --- ★ 新增：持股專屬更新按鈕與排版 ★ ---
         col_title, col_btn = st.columns([8, 2])
-        with col_title:
-            pass # 標題留在下面顯示
+        with col_title: pass
         with col_btn:
             if st.button("🔄 更新報價與配息", use_container_width=True):
-                st.cache_data.clear() # 清除快取，強制重抓
+                st.cache_data.clear()
                 st.rerun()
 
         user_df = get_personal_sheet_data(my_sheet_url)
@@ -360,7 +372,6 @@ elif page == "💼 我的持股":
             unique_codes = user_df['代號'].unique()
             my_holdings_data = []
             
-            # 因為已經加上快取，這裡通常是秒開，除非你按了「更新」按鈕
             with st.spinner("⚡ 正在計算最新行情與配息資訊..."):
                 for code in unique_codes:
                     data = get_etf_details(code)
@@ -379,7 +390,6 @@ elif page == "💼 我的持股":
                 mask = merged_df['總成本'] > 0
                 merged_df.loc[mask, '報酬率%'] = (merged_df.loc[mask, '預估損益'] / merged_df.loc[mask, '總成本']) * 100
                 
-                # 領息計算邏輯
                 merged_df['年領息'] = merged_df['一年配息'] * merged_df['股數']
                 merged_df['成本殖利率%'] = 0.0
                 mask_cost = merged_df['成交均價'] > 0
@@ -387,7 +397,6 @@ elif page == "💼 我的持股":
                 
                 merged_df = merged_df.sort_values(by='代號', ascending=True).reset_index(drop=True)
                 
-                # --- 左右配置儀表板 ---
                 dash_col1, dash_col2 = st.columns([1, 1.5])
                 
                 with dash_col1:
@@ -425,7 +434,6 @@ elif page == "💼 我的持股":
 
                 st.divider()
                 
-                # --- 持股與配息明細表格 ---
                 st.write("### 📄 持股明細")
                 view_cols = ['代號', '名稱', '股數', '成交均價', '現價', '現值', '預估損益', '一年配息', '年領息', '成本殖利率%']
                 view_styler = merged_df[view_cols].style.format({
@@ -439,7 +447,6 @@ elif page == "💼 我的持股":
         else: 
             st.info("您目前尚未建立任何持股。可以從下方管理區新增！")
 
-        # --- 下半部：持股管理區 ---
         st.divider()
         st.write("### ⚙️ 持股管理")
         fast_etf_options = get_fast_etf_list()
@@ -455,7 +462,7 @@ elif page == "💼 我的持股":
                     code_to_save = selected_etf.split(" ")[0]
                     if save_to_personal_sheet(my_sheet_url, code_to_save, new_cost, new_qty):
                         st.success(f"已新增 {code_to_save}！")
-                        st.cache_data.clear() # 新增資料後，順便清掉快取讓畫面重算
+                        st.cache_data.clear()
                         time.sleep(1); st.rerun()
                     else: st.error("儲存失敗，請檢查權限。")
                 else: st.warning("資料不完整")
@@ -482,7 +489,7 @@ elif page == "💼 我的持股":
                     df_to_save = rows_to_save[['代號', '成交均價', '股數']].copy()
                     if update_personal_sheet_batch(my_sheet_url, df_to_save):
                         st.success("✅ 更新成功！")
-                        st.cache_data.clear() # 更新資料後也順便清除快取
+                        st.cache_data.clear()
                         time.sleep(1); st.rerun()
                     else: st.error("存檔失敗。")
 
