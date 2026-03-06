@@ -107,7 +107,7 @@ def update_personal_sheet_batch(sheet_url, new_df):
         st.error(f"更新失敗: {e}")
         return False
 
-# --- ★ 爬蟲核心 1：排行榜專用 (只抓績效與現價，速度極快) ★ ---
+# --- ★ 爬蟲核心 1：排行榜專用 (速度極快) ★ ---
 def get_etf_performance(stock_code):
     url = f"https://histock.tw/stock/{stock_code}"
     try:
@@ -152,14 +152,12 @@ def get_etf_performance(stock_code):
         return data
     except: return None
 
-# --- ★ 爬蟲核心 2：持股明細專用 (深度爬取近一年配息) ★ ---
+# --- ★ 爬蟲核心 2：持股明細專用 (精準抓取近三年最高配息額) ★ ---
 def get_etf_details(stock_code):
-    # 先呼叫上面的函式抓基本資料
     data = get_etf_performance(stock_code)
     if not data: return None
     
     data['一年配息'] = 0.0
-    # 正確的配息專屬網址
     div_url = f"https://histock.tw/stock/{stock_code}/%E9%99%A4%E6%AC%8A%E9%99%A4%E6%81%AF"
     try:
         div_resp = requests.get(div_url, headers=headers)
@@ -174,34 +172,35 @@ def get_etf_details(stock_code):
                 cash_idx = -1
                 year_idx = -1
                 
-                # 自動判斷表格欄位位置
+                # 精準定位「現金」與「年度」的欄位位置
                 for i, text in enumerate(ths):
-                    if '現金' in text or '股利' in text: cash_idx = i
-                    if '發放年度' in text or '所屬年度' in text or '年度' in text: year_idx = i
+                    if '現金' in text: 
+                        cash_idx = i
+                    elif '年度' in text:
+                        if year_idx == -1: year_idx = i
                 
-                if cash_idx != -1:
-                    if year_idx != -1:
-                        # ★ 處理季配息/半年配息：加總同一個「最新年度」的所有配息 ★
-                        latest_year = None
-                        total_div = 0.0
-                        for row in rows[1:]:
-                            tds = row.find_all('td')
-                            if len(tds) > max(cash_idx, year_idx):
-                                y_str = tds[year_idx].text.strip()
-                                c_str = tds[cash_idx].text.strip()
-                                if not latest_year and y_str: 
-                                    latest_year = y_str
-                                
-                                # 只要是最新年度的配息，就一直加總
-                                if y_str == latest_year:
-                                    try: total_div += float(c_str)
-                                    except: pass
-                                else:
-                                    # 遇到舊年度就停止
-                                    if total_div > 0: break
-                        data['一年配息'] = round(total_div, 3)
-                    else:
-                        # 萬一沒有年度，只好直接抓第一筆
+                if cash_idx != -1 and year_idx != -1:
+                    year_divs = {}
+                    # 把歷史配息依據「年度」全部加總起來
+                    for row in rows[1:]:
+                        tds = row.find_all('td')
+                        if len(tds) > max(cash_idx, year_idx):
+                            y_str = tds[year_idx].text.strip()
+                            c_str = tds[cash_idx].text.strip()
+                            if y_str and c_str:
+                                try:
+                                    year_divs[y_str] = year_divs.get(y_str, 0.0) + float(c_str)
+                                except: pass
+                    
+                    if year_divs:
+                        # 取出最近 3 年的年度
+                        sorted_years = sorted(year_divs.keys(), reverse=True)
+                        recent_years = sorted_years[:3]
+                        # 挑出這 3 年裡面「加總配息最高」的那一年，當作預估年領息標準！
+                        data['一年配息'] = round(max([year_divs[y] for y in recent_years]), 3)
+                else:
+                    # 備用方案：萬一找不到年度，就抓第一列的現金數字
+                    if cash_idx != -1:
                         tds = rows[1].find_all('td')
                         if len(tds) > cash_idx:
                             try: data['一年配息'] = float(tds[cash_idx].text.strip())
@@ -240,7 +239,6 @@ def fetch_all_etf_data():
         code = opt.split(" ")[0]
         status_text.text(f"🚀 正在分析 [{i+1}/{len(options)}]: {code} ...")
         progress_bar.progress((i + 1) / len(options))
-        # 排行榜專用：只抓績效不抓配息，節省時間
         data = get_etf_performance(code)
         if data: results.append(data)
         time.sleep(0.05)
@@ -330,7 +328,6 @@ with st.sidebar:
 st.title("💰 台股 ETF 資產管家 (領息強化版)")
 
 if page == "📊 市場排行榜":
-    # 排行榜回來啦！
     st.subheader("🏆 全台 ETF 績效排行")
     st.info("💡 這裡會抓取全台灣的 ETF 並計算績效，載入時間較長。")
     if st.button('🔄 強制更新行情'): st.cache_data.clear(); st.rerun()
@@ -357,9 +354,9 @@ elif page == "💼 我的持股":
             unique_codes = user_df['代號'].unique()
             my_holdings_data = []
             
-            with st.spinner("⚡ 正在為您計算最新報價與配息資訊..."):
+            with st.spinner("⚡ 正在為您計算最新行情與配息資訊..."):
                 for code in unique_codes:
-                    # 持股專用：進入深度爬蟲抓配息
+                    # ★ 呼叫新的深度爬蟲函式
                     data = get_etf_details(code)
                     if data: my_holdings_data.append(data)
             
@@ -397,9 +394,9 @@ elif page == "💼 我的持股":
                     monthly_div = total_div / 12
                     
                     st.metric("總市值", f"${total_value:,.0f}")
-                    st.metric("預估年領息", f"${total_div:,.0f}", help="根據該檔ETF近一年的配息累計計算")
+                    st.metric("預估年領息", f"${total_div:,.0f}", help="根據該檔ETF近三年最高配息年度計算")
+                    st.metric("每月被動收入", f"${monthly_div:,.0f}", help="等於年領息除以12個月")
                     st.metric("總損益", f"${total_pnl:,.0f}", delta=f"{total_pnl:,.0f}")
-                    st.metric("每月平均被動收入", f"${monthly_div:,.0f}")
 
                 with dash_col2:
                     st.write("### 🍩 資產配置")
@@ -416,7 +413,7 @@ elif page == "💼 我的持股":
                         fig.update_traces(textposition='inside', textinfo='percent+label')
                         fig.update_layout(margin=dict(t=10, b=10, l=10, r=10)) 
                         st.plotly_chart(fig, use_container_width=True)
-                        st.caption("💡 提示：點擊右側圖例 (Legend) 可以暫時隱藏/顯示特定 ETF 來重算佔比喔！")
+                        st.caption("💡 提示：點擊右側圖例 (Legend) 可以暫時隱藏特定 ETF 重算佔比！")
                     else:
                         st.info("請至少選擇一檔有現值的持股來顯示圓餅圖。")
 
