@@ -107,7 +107,8 @@ def update_personal_sheet_batch(sheet_url, new_df):
         st.error(f"更新失敗: {e}")
         return False
 
-# --- ★ 爬蟲核心 1：排行榜專用 (速度極快) ★ ---
+# --- ★ 爬蟲核心 1：排行榜專用 (加上快取，一小時內不再重爬) ★ ---
+@st.cache_data(ttl=3600)
 def get_etf_performance(stock_code):
     url = f"https://histock.tw/stock/{stock_code}"
     try:
@@ -152,7 +153,8 @@ def get_etf_performance(stock_code):
         return data
     except: return None
 
-# --- ★ 爬蟲核心 2：持股明細專用 (精準抓取近三年最高配息額) ★ ---
+# --- ★ 爬蟲核心 2：持股明細專用 (加上快取，秒切換分頁的關鍵) ★ ---
+@st.cache_data(ttl=3600)
 def get_etf_details(stock_code):
     data = get_etf_performance(stock_code)
     if not data: return None
@@ -172,7 +174,6 @@ def get_etf_details(stock_code):
                 cash_idx = -1
                 year_idx = -1
                 
-                # 精準定位「現金」與「年度」的欄位位置
                 for i, text in enumerate(ths):
                     if '現金' in text: 
                         cash_idx = i
@@ -181,7 +182,6 @@ def get_etf_details(stock_code):
                 
                 if cash_idx != -1 and year_idx != -1:
                     year_divs = {}
-                    # 把歷史配息依據「年度」全部加總起來
                     for row in rows[1:]:
                         tds = row.find_all('td')
                         if len(tds) > max(cash_idx, year_idx):
@@ -193,13 +193,10 @@ def get_etf_details(stock_code):
                                 except: pass
                     
                     if year_divs:
-                        # 取出最近 3 年的年度
                         sorted_years = sorted(year_divs.keys(), reverse=True)
                         recent_years = sorted_years[:3]
-                        # 挑出這 3 年裡面「加總配息最高」的那一年，當作預估年領息標準！
                         data['一年配息'] = round(max([year_divs[y] for y in recent_years]), 3)
                 else:
-                    # 備用方案：萬一找不到年度，就抓第一列的現金數字
                     if cash_idx != -1:
                         tds = rows[1].find_all('td')
                         if len(tds) > cash_idx:
@@ -348,15 +345,24 @@ elif page == "💼 我的持股":
         current_user = st.session_state["current_user"]
         my_sheet_url = st.session_state["sheet_url"]
         
+        # --- ★ 新增：持股專屬更新按鈕與排版 ★ ---
+        col_title, col_btn = st.columns([8, 2])
+        with col_title:
+            pass # 標題留在下面顯示
+        with col_btn:
+            if st.button("🔄 更新報價與配息", use_container_width=True):
+                st.cache_data.clear() # 清除快取，強制重抓
+                st.rerun()
+
         user_df = get_personal_sheet_data(my_sheet_url)
         
         if not user_df.empty:
             unique_codes = user_df['代號'].unique()
             my_holdings_data = []
             
-            with st.spinner("⚡ 正在為您計算最新行情與配息資訊..."):
+            # 因為已經加上快取，這裡通常是秒開，除非你按了「更新」按鈕
+            with st.spinner("⚡ 正在計算最新行情與配息資訊..."):
                 for code in unique_codes:
-                    # ★ 呼叫新的深度爬蟲函式
                     data = get_etf_details(code)
                     if data: my_holdings_data.append(data)
             
@@ -373,7 +379,7 @@ elif page == "💼 我的持股":
                 mask = merged_df['總成本'] > 0
                 merged_df.loc[mask, '報酬率%'] = (merged_df.loc[mask, '預估損益'] / merged_df.loc[mask, '總成本']) * 100
                 
-                # --- ★ 存股族專屬：領息計算邏輯 ★ ---
+                # 領息計算邏輯
                 merged_df['年領息'] = merged_df['一年配息'] * merged_df['股數']
                 merged_df['成本殖利率%'] = 0.0
                 mask_cost = merged_df['成交均價'] > 0
@@ -449,6 +455,7 @@ elif page == "💼 我的持股":
                     code_to_save = selected_etf.split(" ")[0]
                     if save_to_personal_sheet(my_sheet_url, code_to_save, new_cost, new_qty):
                         st.success(f"已新增 {code_to_save}！")
+                        st.cache_data.clear() # 新增資料後，順便清掉快取讓畫面重算
                         time.sleep(1); st.rerun()
                     else: st.error("儲存失敗，請檢查權限。")
                 else: st.warning("資料不完整")
@@ -475,6 +482,7 @@ elif page == "💼 我的持股":
                     df_to_save = rows_to_save[['代號', '成交均價', '股數']].copy()
                     if update_personal_sheet_batch(my_sheet_url, df_to_save):
                         st.success("✅ 更新成功！")
+                        st.cache_data.clear() # 更新資料後也順便清除快取
                         time.sleep(1); st.rerun()
                     else: st.error("存檔失敗。")
 
